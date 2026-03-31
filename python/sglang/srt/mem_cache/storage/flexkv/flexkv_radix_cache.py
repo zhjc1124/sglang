@@ -24,8 +24,7 @@ try:
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
-    from flexkv.kvmanager import KVManager
-    from flexkv.server.client import KVTPClient
+    from flexkv.kv_group import KVManagerGroup, KVTPClientGroup
 except ImportError as e:
     raise RuntimeError("FlexKV is not installed. Please install it.") from e
 
@@ -134,32 +133,46 @@ class FlexKVConnector:
         page_size: int,
         tp_size: int,
         tp_rank: int,
-        k_pool: torch.Tensor,
-        v_pool: torch.Tensor,
+        kv_caches: List[torch.Tensor],
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        num_local_layers: int = 0,
     ):
         self.flexkv_config = FlexKVConfig.from_env()
         self.flexkv_config.post_init_from_sglang_config(
-            sglang_config=sgl_config, tp_size=tp_size, page_size=page_size
+            sglang_config=sgl_config, tp_size=tp_size, page_size=page_size,
+            num_local_layers=num_local_layers,
         )
 
         self.sgl_config = sgl_config
         self.tp_size = tp_size
         self.rank = tp_rank
-        self.k_pool = k_pool
-        self.v_pool = v_pool
+        self.kv_caches = kv_caches
         self.tp_group = tp_group
+        self.indexer_buffers = indexer_buffers
+        self.page_size = page_size
 
         if self.rank == 0:
-            self.kv_manager = KVManager(
+            self.kv_manager = KVManagerGroup(
                 model_config=self.flexkv_config.model_config,
                 cache_config=self.flexkv_config.cache_config,
                 server_recv_port=self.flexkv_config.server_recv_port,
+                indexer_model_config=self.flexkv_config.indexer_model_config,
+                indexer_cache_config=self.flexkv_config.indexer_cache_config,
+                indexer_server_recv_port=self.flexkv_config.indexer_server_recv_port,
+                indexer_gpu_register_port=self.flexkv_config.indexer_gpu_register_port,
             )
             self.kv_manager.start()
 
-        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
-        self.register_to_server(self.k_pool, self.v_pool)
+        self._tp_client_group = KVTPClientGroup(
+            gpu_register_port=self.flexkv_config.gpu_register_port,
+            client_id=0,
+            device_id=self.rank,
+            indexer_gpu_register_port=self.flexkv_config.indexer_gpu_register_port,
+        )
+        self.tp_client = self._tp_client_group.tp_client
+
+        self.register_to_server(self.kv_caches, self.indexer_buffers)
 
         # task_id -> req_id mapping (rank 0 only)
         self.inflight_taskid2reqid: Dict[int, int] = {}
@@ -167,7 +180,7 @@ class FlexKVConnector:
         self.inflight_skipped_reqids: List[int] = []
 
         # Layer-by-layer transfer config
-        self.num_layers = sgl_config.num_hidden_layers if sgl_config else 0
+        self.num_layers = self.flexkv_config.model_config.num_layers
         self.enable_layerwise_transfer = bool(
             int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", 1))
         )
@@ -374,13 +387,25 @@ class FlexKVConnector:
         if self.tp_group is not None and self.tp_size > 1:
             torch.distributed.barrier(self.tp_group)
 
-    def register_to_server(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]) -> None:
-        """Register GPU KV cache buffers to FlexKV server."""
-        assert len(k_caches) == len(v_caches)
-        assert k_caches[0].ndim == 3, f"Expected 3D tensor, got shape={k_caches[0].shape}"
+    def register_to_server(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+    ) -> None:
+        """Register GPU KV cache buffers to FlexKV server.
 
-        num_layer = len(k_caches)
-        num_blocks, num_kv_heads, head_size = k_caches[0].shape
+        Args:
+            kv_caches: Unified KV cache tensor list.
+                - MLA: num_layer tensors (K and V share the same buffer).
+                - MHA: 2 * num_layer tensors (K buffers followed by V buffers).
+            indexer_buffers: Optional sparse attention indexer buffers.
+        """
+        assert len(kv_caches) > 0
+        assert kv_caches[0].ndim == 3, f"Expected 3D tensor, got shape={kv_caches[0].shape}"
+
+        is_mla = self.flexkv_config.model_config.use_mla
+        num_layer = len(kv_caches) if is_mla else len(kv_caches) // 2
+        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
@@ -389,9 +414,34 @@ class FlexKVConnector:
             tokens_per_block=1,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=False,
+            is_mla=is_mla,
         )
-        self.tp_client.register_to_server(k_caches + v_caches, gpu_layout)
+
+        # Build indexer layout if indexer buffers are present
+        indexer_layout = None
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_tensor = indexer_buffers[0]
+            assert indexer_tensor.ndim == 2, (
+                f"Expected 2D indexer tensor (num_pages, page_stride_size), "
+                f"got shape={indexer_tensor.shape}"
+            )
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=indexer_tensor.shape[0],
+                tokens_per_block=1,
+                num_head=1,
+                head_size=indexer_tensor.shape[1],
+                is_mla=True,
+            )
+
+        # Delegate to wrapper which handles both main and indexer registration
+        self._tp_client_group.register_to_server(
+            kv_caches=kv_caches,
+            gpu_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
         logger.info("[FlexKV] Registered KV caches to server")
 
     def shutdown(self) -> None:
@@ -408,6 +458,8 @@ class FlexKVRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_size: int = 1,
+        pp_rank: int = 0,
     ):
         self.rank = rank
         self.tp_group = tp_group
@@ -420,27 +472,51 @@ class FlexKVRadixCache(RadixCache):
         self.sts_flexkv_cache_len = 0
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+
+        indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            logger.info(
+                f"[FlexKV] Detected sparse attention indexer cache with "
+                f"{len(indexer_buffers)} indexer layers, "
+                f"shape={indexer_buffers[0].shape}"
+            )
+
+        if hasattr(kvcache, "kv_buffer"):
+            # MLA: K and V share the same buffer, register once per layer
+            kv_caches = kvcache.kv_buffer
+        elif hasattr(kvcache, "k_buffer"):
+            # MHA: separate K and V buffers, concat as [k_layers..., v_layers...]
+            kv_caches = kvcache.k_buffer + kvcache.v_buffer
+        else:
+            raise AttributeError(
+                f"Unsupported KV cache type {type(kvcache).__name__}: "
+                f"expected 'kv_buffer' (MLA/NSA) or 'k_buffer'/'v_buffer' (MHA)."
+            )
+
+        _pp_size = pp_size if pp_size > 0 else 1
+        _pp_rank = pp_rank
+        if _pp_size > 1:
+            from sglang.srt.distributed.utils import get_pp_indices
+            total_layers = int(getattr(model_config, "num_hidden_layers", 0))
+            start_layer, end_layer = get_pp_indices(total_layers, _pp_rank, _pp_size)
+            num_local_layers = end_layer - start_layer
+        else:
+            num_local_layers = 0
+
         self.flexkv_connector = FlexKVConnector(
             sgl_config=model_config,
             page_size=params.page_size,
             tp_size=tp_size,
             tp_rank=rank,
             tp_group=tp_group,
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(params.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(params.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            kv_caches=kv_caches,
+            indexer_buffers=indexer_buffers,
+            num_local_layers=num_local_layers,
         )
 
         self.layer_done_counter = self.flexkv_connector.layer_done_counter
         self.flexkv_connector.register_layer_transfer_counter(kvcache)
-        self.num_layers = model_config.num_hidden_layers if model_config else 0
+        self.num_layers = self.flexkv_connector.num_layers
 
         self.load_queue: List[FlexKVLoadOperation] = []
         self.pending_load_info: Dict[str, tuple] = {}  # rid -> (task_id, key, gpu_cached_len)
