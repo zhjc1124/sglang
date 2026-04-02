@@ -567,6 +567,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # FlexKV
+    enable_flexkv: bool = False
+
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
@@ -792,6 +795,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Handle FlexKV settings.
+        self._handle_flexkv()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -2909,6 +2915,19 @@ class ServerArgs:
                 "flashinfer" if is_sm100_supported() else "triton"
             )
         return False
+
+    def _handle_flexkv(self):
+        if self.enable_flexkv:
+            # Fix for the compatibility issue with FlashAttention3 decoding and FlexKV.
+            if self.decode_attention_backend is None:
+                if not self.use_mla_backend():
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
 
     def _handle_speculative_decoding(self):
         if (
@@ -5117,6 +5136,13 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # FlexKV
+        parser.add_argument(
+            "--enable-flexkv",
+            action="store_true",
+            help="Using FlexKV as an alternative distributed cache solution",
         )
 
         # Ktransformer server args

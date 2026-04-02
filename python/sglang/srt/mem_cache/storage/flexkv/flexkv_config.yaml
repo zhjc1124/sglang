@@ -1,0 +1,5 @@
+cpu_cache_gb: 100
+ssd_cache_gb: 0
+ssd_cache_dir: /data/flexkv_ssd/
+enable_gds: false
+

@@ -227,6 +227,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
@@ -237,7 +238,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         Notify the cache controller to start the KV cache loading
         """
-        raise NotImplementedError()
+        return -1
+
+    def prefetch(self, req: Req) -> None:
+        return
 
     def flush_write_through_acks(self) -> None:
         """Release lock_ref on radix-tree nodes whose write-through has completed.
@@ -247,11 +251,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         pass
 
-    def check_hicache_events(self) -> Any:
+    def check_kv_events(self) -> Any:
         """
-        Check HiCache related activities to update radix tree and synchronize across TP workers if needed
+        Check HiCache related activities to update radix tree and synchronize across TP workers if needed.
+        Default implementation does nothing (for non-hierarchical cache).
         """
         raise NotImplementedError()
+
+    def can_be_scheduled(self, req: Req) -> bool:
+        """
+        Check if the request can be added to the batch.
+        """
+        return True
+
+    def release_aborted_request(self, rid: str) -> None:
+        """
+        Release the request from the cache.
+        """
+        pass
 
     def take_events(self):
         return []

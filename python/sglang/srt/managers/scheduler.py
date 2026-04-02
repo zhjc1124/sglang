@@ -796,6 +796,26 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                 )
+            elif server_args.enable_flexkv:
+                from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
+                    FlexKVRadixCache,
+                )
+
+                self.tree_cache = FlexKVRadixCache(
+                    params=params,
+                    server_args=self.server_args,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=(
+                        self.attn_tp_cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_cpu_group
+                    ),
+                )
+                self.tp_worker.register_layer_transfer_counter(
+                    self.tree_cache.layer_done_counter
+                )
             else:
                 self.tree_cache = RadixCache(params)
 
@@ -2217,6 +2237,7 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
+                self.running_batch.batch_is_full = False
                 ret = None
 
         # Handle DP attention and log stats
@@ -2306,6 +2327,8 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
+        # Check hierarchical cache events (no-op for non-hierarchical cache)
+        self.tree_cache.check_kv_events()
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
@@ -2451,7 +2474,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -3138,9 +3161,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
+            # to release prefetch events associated with the request
+            self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
