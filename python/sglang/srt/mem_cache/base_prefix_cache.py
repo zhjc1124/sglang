@@ -256,7 +256,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed.
         Default implementation does nothing (for non-hierarchical cache).
         """
-        raise NotImplementedError()
+        pass
 
     def can_be_scheduled(self, req: Req) -> bool:
         """
