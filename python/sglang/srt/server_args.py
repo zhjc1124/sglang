@@ -2919,6 +2919,8 @@ class ServerArgs:
     def _handle_flexkv(self):
         if self.enable_flexkv:
             # Fix for the compatibility issue with FlashAttention3 decoding and FlexKV.
+            if self.attention_backend == "nsa":
+                return
             if self.decode_attention_backend is None:
                 if not self.use_mla_backend():
                     self.decode_attention_backend = (
