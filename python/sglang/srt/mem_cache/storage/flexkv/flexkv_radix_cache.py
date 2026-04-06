@@ -302,6 +302,19 @@ class FlexKVConnector:
             token_ids_np = np.array(token_ids, dtype=np.int64)
             assert len(token_ids) == len(kv_indices)
 
+            # Page-align token_ids and kv_indices BEFORE put_match so that
+            # put_match allocates dst_block_ids consistent with the slot_mapping
+            # we will later pass to launch().
+            original_len = len(token_ids_np)
+            if self.page_size > 1:
+                aligned_len = (original_len // self.page_size) * self.page_size
+                if aligned_len == 0:
+                    self.inflight_skipped_reqids.append(req_id)
+                    return -1
+                if aligned_len < original_len:
+                    token_ids_np = token_ids_np[:aligned_len]
+                    kv_indices = kv_indices[:aligned_len]
+
             task_id, unmatched_mask = self.kv_manager.put_match(
                 token_ids=token_ids_np, token_mask=None
             )
@@ -309,25 +322,7 @@ class FlexKVConnector:
             if unmatched_mask.sum() > 0:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
-
-                # Page-align slot_mapping after unmatched_mask filtering
-                if self.page_size > 1:
-                    num_slots = slot_mapping.numel()
-                    aligned_slots = (num_slots // self.page_size) * self.page_size
-                    if aligned_slots == 0:
-                        logger.debug(
-                            "[FlexKV] store_kv_async: unmatched slots %d < page_size %d, "
-                            "skipping (task_id=%d)",
-                            num_slots, self.page_size, task_id,
-                        )
-                        self.inflight_skipped_reqids.append(req_id)
-                        return -1
-                    if aligned_slots < num_slots:
-                        logger.debug(
-                            "[FlexKV] store_kv_async: unmatched slots page_align %d -> %d",
-                            num_slots, aligned_slots,
-                        )
-                        slot_mapping = slot_mapping[:aligned_slots]
+                slot_mapping = slot_mapping.to(torch.int64)
 
                 self.kv_manager.launch(task_ids=[task_id], slot_mappings=[slot_mapping])
                 self.inflight_taskid2reqid[task_id] = req_id
@@ -375,6 +370,7 @@ class FlexKVConnector:
                 continue
             
             slot_mapping_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+            slot_mapping_cpu = slot_mapping_cpu.to(torch.int64)
             task_ids.append(op.task_id)
             slot_mappings.append(slot_mapping_cpu)
         
@@ -401,6 +397,7 @@ class FlexKVConnector:
                     continue
                 
                 slot_mapping_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+                slot_mapping_cpu = slot_mapping_cpu.to(torch.int64)
                 task_ids.append(op.task_id)
                 slot_mappings.append(slot_mapping_cpu)
 
@@ -446,11 +443,17 @@ class FlexKVConnector:
         num_layer = len(kv_caches) if is_mla else len(kv_caches) // 2
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
+        # GPU layout uses page_size as tokens_per_block so that the transfer
+        # engine's block_stride covers an entire page of tokens.  The physical
+        # GPU tensor shape is [num_blocks, num_kv_heads, head_size] where each
+        # slot stores 1 token, but we present it to FlexKV as
+        # [num_blocks/page_size, page_size, num_kv_heads, head_size] so that
+        # block_id * block_stride correctly addresses the start of a page.
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=num_layer,
-            num_block=num_blocks,
-            tokens_per_block=1,
+            num_block=num_blocks // self.page_size,
+            tokens_per_block=self.page_size,
             num_head=num_kv_heads,
             head_size=head_size,
             is_mla=is_mla,
@@ -480,14 +483,15 @@ class FlexKVConnector:
                 len(indexer_buffers), indexer_tensor.shape[0],
                 1, indexer_tensor.shape[1],
             )
-            # Consistency check: indexer num_block should equal main KV num_block // page_size
+            # Consistency check: indexer num_block should equal main KV num_block
+            # (1:1 mapping since tokens_per_block = page_size)
             indexer_config = self.flexkv_config.cache_config.indexer
             if indexer_config is not None:
-                expected_indexer_blocks = num_blocks // indexer_config.page_size
+                expected_indexer_blocks = num_blocks // self.page_size
                 assert indexer_tensor.shape[0] == expected_indexer_blocks, (
                     f"[FlexKV] Indexer num_block mismatch: indexer has {indexer_tensor.shape[0]} pages, "
-                    f"but main KV has {num_blocks} blocks / page_size {indexer_config.page_size} "
-                    f"= {expected_indexer_blocks} expected pages"
+                    f"but main KV has {num_blocks} slots / page_size {self.page_size} "
+                    f"= {expected_indexer_blocks} expected blocks"
                 )
 
         # Register KV caches (and optional indexer buffers) to FlexKV server
@@ -653,17 +657,6 @@ class FlexKVRadixCache(RadixCache):
             }], self.global_rank, self.tp_group, src=self.tp_src_rank)[0]
             flexkv_hit_length = broadcast_data['flexkv_hit_length']
             flexkv_task_id = broadcast_data['flexkv_task_id']
-
-        # Page-align host_hit_length: ensure GET loads complete pages
-        if flexkv_hit_length > 0:
-            page_size = self.flexkv_connector.page_size
-            aligned_hit = (flexkv_hit_length // page_size) * page_size
-            if aligned_hit < flexkv_hit_length:
-                logger.debug(
-                    "[FlexKV] match_prefix: host_hit_length page_align %d -> %d (page_size=%d)",
-                    flexkv_hit_length, aligned_hit, page_size,
-                )
-                flexkv_hit_length = aligned_hit
 
         self.sts_flexkv_cache_len += flexkv_hit_length
 
