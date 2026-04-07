@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     InitLoadBackParams,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode, page_align_keys
 from sglang.srt.mem_cache.storage.flexkv.flexkv_ipc_utils import (
     EFD_SEMAPHORE,
     eventfd,
@@ -140,21 +140,27 @@ class FlexKVConnector:
         page_size: int,
         tp_size: int,
         tp_rank: int,
-        k_pool: torch.Tensor,
-        v_pool: torch.Tensor,
+        kv_caches: List[torch.Tensor],
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        num_local_layers: int = 0,
+        pp_size: int = 1,
+        pp_rank: int = 0,
     ):
         self.flexkv_config = FlexKVConfig.from_env()
         self.flexkv_config.post_init_from_sglang_config(
-            sglang_config=sgl_config, tp_size=tp_size, page_size=page_size
+            sglang_config=sgl_config, tp_size=tp_size, page_size=page_size,
+            num_local_layers=num_local_layers,
+            pp_size=pp_size, pp_rank=pp_rank,
         )
 
         self.sgl_config = sgl_config
         self.tp_size = tp_size
         self.rank = tp_rank
-        self.k_pool = k_pool
-        self.v_pool = v_pool
+        self.kv_caches = kv_caches
         self.tp_group = tp_group
+        self.indexer_buffers = indexer_buffers
+        self.page_size = page_size
 
         if self.rank == 0:
             self.kv_manager = KVManager(
@@ -165,7 +171,7 @@ class FlexKVConnector:
             self.kv_manager.start()
 
         self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
-        self.register_to_server(self.k_pool, self.v_pool)
+        self.register_to_server(self.kv_caches, self.indexer_buffers)
 
         # task_id -> req_id mapping (rank 0 only)
         self.inflight_taskid2reqid: Dict[int, int] = {}
@@ -173,7 +179,7 @@ class FlexKVConnector:
         self.inflight_skipped_reqids: List[int] = []
 
         # Layer-by-layer transfer config
-        self.num_layers = sgl_config.num_hidden_layers if sgl_config else 0
+        self.num_layers = self.flexkv_config.model_config.num_layers
         self.enable_layerwise_transfer = bool(
             int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", 1))
         )
@@ -296,6 +302,19 @@ class FlexKVConnector:
             token_ids_np = np.array(token_ids, dtype=np.int64)
             assert len(token_ids) == len(kv_indices)
 
+            # Page-align token_ids and kv_indices BEFORE put_match so that
+            # put_match allocates dst_block_ids consistent with the slot_mapping
+            # we will later pass to launch().
+            original_len = len(token_ids_np)
+            if self.page_size > 1:
+                aligned_len = (original_len // self.page_size) * self.page_size
+                if aligned_len == 0:
+                    self.inflight_skipped_reqids.append(req_id)
+                    return -1
+                if aligned_len < original_len:
+                    token_ids_np = token_ids_np[:aligned_len]
+                    kv_indices = kv_indices[:aligned_len]
+
             task_id, unmatched_mask = self.kv_manager.put_match(
                 token_ids=token_ids_np, token_mask=None
             )
@@ -303,6 +322,8 @@ class FlexKVConnector:
             if unmatched_mask.sum() > 0:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
+                slot_mapping = slot_mapping.to(torch.int64)
+
                 self.kv_manager.launch(task_ids=[task_id], slot_mappings=[slot_mapping])
                 self.inflight_taskid2reqid[task_id] = req_id
                 return task_id
@@ -349,6 +370,7 @@ class FlexKVConnector:
                 continue
             
             slot_mapping_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+            slot_mapping_cpu = slot_mapping_cpu.to(torch.int64)
             task_ids.append(op.task_id)
             slot_mappings.append(slot_mapping_cpu)
         
@@ -375,6 +397,7 @@ class FlexKVConnector:
                     continue
                 
                 slot_mapping_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+                slot_mapping_cpu = slot_mapping_cpu.to(torch.int64)
                 task_ids.append(op.task_id)
                 slot_mappings.append(slot_mapping_cpu)
 
@@ -395,24 +418,89 @@ class FlexKVConnector:
         if self.tp_group is not None and self.tp_size > 1:
             torch.distributed.barrier(self.tp_group)
 
-    def register_to_server(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]) -> None:
-        """Register GPU KV cache buffers to FlexKV server."""
-        assert len(k_caches) == len(v_caches)
-        assert k_caches[0].ndim == 3, f"Expected 3D tensor, got shape={k_caches[0].shape}"
+    def register_to_server(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+    ) -> None:
+        """Register GPU KV cache buffers to FlexKV server.
 
-        num_layer = len(k_caches)
-        num_blocks, num_kv_heads, head_size = k_caches[0].shape
+        Args:
+            kv_caches: Unified KV cache tensor list.
+                - MLA: num_layer tensors (K and V share the same buffer).
+                - MHA: 2 * num_layer tensors (K buffers followed by V buffers).
+            indexer_buffers: Optional sparse attention indexer buffers.
+        """
+        assert len(kv_caches) > 0
+        assert kv_caches[0].ndim == 3, f"Expected 3D tensor, got shape={kv_caches[0].shape}"
 
+        is_mla = self.flexkv_config.model_config.use_mla
+        if not is_mla:
+            assert len(kv_caches) % 2 == 0, (
+                f"MHA mode expects even number of kv_caches (k_buffers + v_buffers), "
+                f"got {len(kv_caches)}"
+            )
+        num_layer = len(kv_caches) if is_mla else len(kv_caches) // 2
+        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
+
+        # GPU layout uses page_size as tokens_per_block so that the transfer
+        # engine's block_stride covers an entire page of tokens.  The physical
+        # GPU tensor shape is [num_blocks, num_kv_heads, head_size] where each
+        # slot stores 1 token, but we present it to FlexKV as
+        # [num_blocks/page_size, page_size, num_kv_heads, head_size] so that
+        # block_id * block_stride correctly addresses the start of a page.
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=num_layer,
-            num_block=num_blocks,
-            tokens_per_block=1,
+            num_block=num_blocks // self.page_size,
+            tokens_per_block=self.page_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=False,
+            is_mla=is_mla,
         )
-        self.tp_client.register_to_server(k_caches + v_caches, gpu_layout)
+
+        # Build indexer layout if indexer buffers are present
+        indexer_layout = None
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_tensor = indexer_buffers[0]
+            assert indexer_tensor.ndim == 2, (
+                f"Expected 2D indexer tensor (num_pages, page_stride_size), "
+                f"got shape={indexer_tensor.shape}"
+            )
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_buffers),
+                num_block=indexer_tensor.shape[0],
+                tokens_per_block=1,
+                num_head=1,
+                head_size=indexer_tensor.shape[1],
+                is_mla=True,
+            )
+            # Log indexer layout details for observability
+            logger.debug(
+                "[FlexKV] Indexer layout: num_layer=%d, num_block=%d, "
+                "tokens_per_block=%d, head_size=%d",
+                len(indexer_buffers), indexer_tensor.shape[0],
+                1, indexer_tensor.shape[1],
+            )
+            # Consistency check: indexer num_block should equal main KV num_block
+            # (1:1 mapping since tokens_per_block = page_size)
+            indexer_config = self.flexkv_config.cache_config.indexer
+            if indexer_config is not None:
+                expected_indexer_blocks = num_blocks // self.page_size
+                assert indexer_tensor.shape[0] == expected_indexer_blocks, (
+                    f"[FlexKV] Indexer num_block mismatch: indexer has {indexer_tensor.shape[0]} pages, "
+                    f"but main KV has {num_blocks} slots / page_size {self.page_size} "
+                    f"= {expected_indexer_blocks} expected blocks"
+                )
+
+        # Register KV caches (and optional indexer buffers) to FlexKV server
+        self.tp_client.register_to_server(
+            kv_caches=kv_caches,
+            kv_layout=gpu_layout,
+            indexer_buffers=indexer_buffers,
+            indexer_layout=indexer_layout,
+        )
         logger.info("[FlexKV] Registered KV caches to server")
 
     def shutdown(self) -> None:
@@ -429,10 +517,20 @@ class FlexKVRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_size: int = 1,
+        pp_rank: int = 0,
     ):
         self.rank = rank
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.pp_size = pp_size if pp_size > 0 else 1
+        self.pp_rank = pp_rank
+
+        self.global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if tp_group is not None and tp_size > 1:
+            self.tp_src_rank = torch.distributed.get_global_rank(tp_group, 0)
+        else:
+            self.tp_src_rank = 0
 
         # req_id -> last node mapping (all ranks)
         self.inflight_reqid2node: Dict[int, TreeNode] = {}
@@ -441,27 +539,53 @@ class FlexKVRadixCache(RadixCache):
         self.sts_flexkv_cache_len = 0
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+
+        indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            logger.info(
+                f"[FlexKV] Detected sparse attention indexer cache with "
+                f"{len(indexer_buffers)} indexer layers, "
+                f"shape={indexer_buffers[0].shape}"
+            )
+
+        if hasattr(kvcache, "kv_buffer"):
+            # MLA: K and V share the same buffer, register once per layer
+            kv_caches = kvcache.kv_buffer
+        elif hasattr(kvcache, "k_buffer"):
+            # MHA: separate K and V buffers, concat as [k_layers..., v_layers...]
+            kv_caches = kvcache.k_buffer + kvcache.v_buffer
+        else:
+            raise AttributeError(
+                f"Unsupported KV cache type {type(kvcache).__name__}: "
+                f"expected 'kv_buffer' (MLA/NSA) or 'k_buffer'/'v_buffer' (MHA)."
+            )
+
+        _pp_size = pp_size if pp_size > 0 else 1
+        _pp_rank = pp_rank
+        if _pp_size > 1:
+            from sglang.srt.distributed.utils import get_pp_indices
+            total_layers = int(getattr(model_config, "num_hidden_layers", 0))
+            start_layer, end_layer = get_pp_indices(total_layers, _pp_rank, _pp_size)
+            num_local_layers = end_layer - start_layer
+        else:
+            num_local_layers = 0
+
         self.flexkv_connector = FlexKVConnector(
             sgl_config=model_config,
             page_size=params.page_size,
             tp_size=tp_size,
             tp_rank=rank,
             tp_group=tp_group,
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(params.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(params.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            kv_caches=kv_caches,
+            indexer_buffers=indexer_buffers,
+            num_local_layers=num_local_layers,
+            pp_size=self.pp_size,
+            pp_rank=self.pp_rank,
         )
 
         self.layer_done_counter = self.flexkv_connector.layer_done_counter
         self.flexkv_connector.register_layer_transfer_counter(kvcache)
-        self.num_layers = model_config.num_hidden_layers if model_config else 0
+        self.num_layers = self.flexkv_connector.num_layers
 
         self.load_queue: List[FlexKVLoadOperation] = []
         self.pending_load_info: Dict[str, tuple] = {}  # rid -> (task_id, key, gpu_cached_len)
@@ -470,7 +594,6 @@ class FlexKVRadixCache(RadixCache):
         super().__init__(params)
 
     def reset(self):
-        super().reset()
         if self.rank == 0:
             for task_id in list(self.flexkv_connector.inflight_taskid2reqid.keys()):
                 self.flexkv_connector.wait_task(task_id)
@@ -485,7 +608,9 @@ class FlexKVRadixCache(RadixCache):
         self.ongoing_load_back.clear()
 
         self.load_queue.clear()
-        self.pending_load_info.clear()       
+        self.pending_load_info.clear()
+
+        super().reset()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match prefix against GPU cache and query FlexKV for uncached tokens."""
@@ -529,7 +654,7 @@ class FlexKVRadixCache(RadixCache):
             broadcast_data = broadcast_pyobj([{
                 'flexkv_hit_length': flexkv_hit_length,
                 'flexkv_task_id': flexkv_task_id,
-            }], self.rank, self.tp_group, src=0)[0]
+            }], self.global_rank, self.tp_group, src=self.tp_src_rank)[0]
             flexkv_hit_length = broadcast_data['flexkv_hit_length']
             flexkv_task_id = broadcast_data['flexkv_task_id']
 
@@ -676,12 +801,21 @@ class FlexKVRadixCache(RadixCache):
             return producer_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+        # Save kv_committed_len before super() pops it (pop_committed_kv_cache
+        # sets kv_committed_freed=True and cannot be called again).
+        kv_committed_len = req.kv_committed_len
+
         super().cache_finished_req(req, is_insert=is_insert)
 
         if req.req_pool_idx is None and not is_insert:
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # Reuse sglang's page_align_keys to truncate to page boundary
+        token_ids = page_align_keys(token_ids, self.page_size)
+        if len(token_ids) == 0:
+            self.flexkv_connector.inflight_skipped_reqids.append(req.req_pool_idx)
+            return
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -711,6 +845,11 @@ class FlexKVRadixCache(RadixCache):
         super().cache_unfinished_req(req, chunked=chunked)
 
         token_ids = req.fill_ids
+        # Reuse sglang's page_align_keys to truncate to page boundary
+        token_ids = page_align_keys(token_ids, self.page_size)
+        if len(token_ids) == 0:
+            self.flexkv_connector.inflight_skipped_reqids.append(req.req_pool_idx)
+            return
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -827,7 +966,7 @@ class FlexKVRadixCache(RadixCache):
         if self.tp_group is not None and self.tp_size > 1:
             payload = broadcast_pyobj(
                 [{'completed': completed, 'skipped': skipped}] if self.rank == 0 else [None],
-                self.rank, self.tp_group, src=0
+                self.global_rank, self.tp_group, src=self.tp_src_rank
             )[0]
             to_release = payload['completed'] + payload['skipped']
         else:

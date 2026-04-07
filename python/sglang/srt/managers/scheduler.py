@@ -812,6 +812,8 @@ class Scheduler(
                         if self.server_args.enable_dp_attention
                         else self.tp_cpu_group
                     ),
+                    pp_size=self.server_args.pp_size,
+                    pp_rank=self.pp_rank,
                 )
                 self.tp_worker.register_layer_transfer_counter(
                     self.tree_cache.layer_done_counter
