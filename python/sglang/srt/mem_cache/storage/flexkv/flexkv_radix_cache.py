@@ -181,7 +181,7 @@ class FlexKVConnector:
         # Layer-by-layer transfer config
         self.num_layers = self.flexkv_config.model_config.num_layers
         self.enable_layerwise_transfer = bool(
-            int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", 1))
+            int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", 0))
         )
         self.layerwise_eventfd_socket = os.getenv(
             "FLEXKV_LAYERWISE_EVENTFD_SOCKET", "/tmp/flexkv_layerwise_eventfd.sock"
