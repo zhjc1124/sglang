@@ -63,7 +63,7 @@ def recv_fds(sock: socket.socket, num_fds: int):
     # Ancillary buffer size: need space for num_fds integers
     anc_buf_size = socket.CMSG_SPACE(num_fds * struct.calcsize("i"))
     
-    nbytes, ancdata, flags, addr = sock.recvmsg_into([data_buf], anc_buf_size, anc_buf_size)
+    nbytes, ancdata, flags, addr = sock.recvmsg_into([data_buf], anc_buf_size, 0)
     data = bytes(data_buf[:nbytes])
 
     fds = []

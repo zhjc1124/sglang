@@ -806,7 +806,7 @@ class Scheduler(
                     server_args=self.server_args,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
-                    rank=self.tp_rank,
+                    tp_rank=self.tp_rank,
                     tp_group=(
                         self.attn_tp_cpu_group
                         if self.server_args.enable_dp_attention
@@ -814,6 +814,8 @@ class Scheduler(
                     ),
                     pp_size=self.server_args.pp_size,
                     pp_rank=self.pp_rank,
+                    dp_size=self.dp_size,
+                    dp_rank=self.dp_rank,
                 )
                 self.tp_worker.register_layer_transfer_counter(
                     self.tree_cache.layer_done_counter

@@ -146,32 +146,67 @@ class FlexKVConnector:
         num_local_layers: int = 0,
         pp_size: int = 1,
         pp_rank: int = 0,
+        dp_size: int = 1,
+        dp_rank: int = 0,
     ):
+        # Normalise None to safe defaults (PP-only mode may pass None)
+        dp_rank = dp_rank if dp_rank is not None else 0
+        dp_size = dp_size if dp_size is not None else 1
+
         self.flexkv_config = FlexKVConfig.from_env()
         self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sgl_config, tp_size=tp_size, page_size=page_size,
             num_local_layers=num_local_layers,
             pp_size=pp_size, pp_rank=pp_rank,
+            dp_size=dp_size, dp_rank=dp_rank,
         )
 
         self.sgl_config = sgl_config
         self.tp_size = tp_size
-        self.rank = tp_rank
+        self.tp_rank = tp_rank
         self.kv_caches = kv_caches
         self.tp_group = tp_group
         self.indexer_buffers = indexer_buffers
         self.page_size = page_size
 
-        if self.rank == 0:
+        if self.tp_rank == 0:
             self.kv_manager = KVManager(
                 model_config=self.flexkv_config.model_config,
                 cache_config=self.flexkv_config.cache_config,
+                dp_client_id=int(dp_rank),
                 server_recv_port=self.flexkv_config.server_recv_port,
+                gpu_register_port=self.flexkv_config.gpu_register_port,
             )
             self.kv_manager.start()
 
-        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
+        rank_parts = []
+        if int(tp_size) > 1:
+            rank_parts.append(f"tp_rank={int(tp_rank)}")
+        if int(pp_size) > 1:
+            rank_parts.append(f"pp_rank={int(pp_rank)}")
+        if int(self.flexkv_config.model_config.dp_size) > 1:
+            rank_parts.append(f"dp_rank={int(dp_rank)}")
+        self._rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
+
+        if self.tp_rank == 0:
+            logger.info(
+                f"[FlexKV] Creating KVManager{self._rank_label}: "
+                f"server_recv_port={self.flexkv_config.server_recv_port}, "
+                f"gpu_register_port={self.flexkv_config.gpu_register_port}")
+
+        # Use globally unique device_id: dp_rank * tp_size + tp_rank
+        # so that GPUs from different DP ranks don't collide in TransferManager.
+        # NOTE: This only works for single-node DP. Multi-node DP is not
+        # considered here.
+        global_device_id = int(dp_rank) * int(tp_size) + int(self.tp_rank)
+        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, int(dp_rank), global_device_id)
+        logger.info(
+            f"[FlexKV] KVTPClient created{self._rank_label}: "
+            f"gpu_register_port={self.flexkv_config.gpu_register_port}")
         self.register_to_server(self.kv_caches, self.indexer_buffers)
+        logger.info(
+            f"[FlexKV] KVTPClient registered to server{self._rank_label}: "
+            f"gpu_register_port={self.flexkv_config.gpu_register_port}")
 
         # task_id -> req_id mapping (rank 0 only)
         self.inflight_taskid2reqid: Dict[int, int] = {}
@@ -183,9 +218,27 @@ class FlexKVConnector:
         self.enable_layerwise_transfer = bool(
             int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", 0))
         )
-        self.layerwise_eventfd_socket = os.getenv(
+        base_eventfd_socket = os.getenv(
             "FLEXKV_LAYERWISE_EVENTFD_SOCKET", "/tmp/flexkv_layerwise_eventfd.sock"
         )
+        _pp_size = int(self.flexkv_config.model_config.pp_size or 1)
+        _pp_rank = int(self.flexkv_config.model_config.pp_rank or 0)
+        _dp_size = int(self.flexkv_config.model_config.dp_size or 1)
+        _dp_rank = int(dp_rank)
+        sock_suffix = ""
+        if _pp_size > 1:
+            sock_suffix += f"_pp{_pp_rank}"
+        if _dp_size > 1:
+            sock_suffix += f"_dp{_dp_rank}"
+        if sock_suffix:
+            root, ext = os.path.splitext(base_eventfd_socket)
+            self.layerwise_eventfd_socket = f"{root}{sock_suffix}{ext}"
+        else:
+            self.layerwise_eventfd_socket = base_eventfd_socket
+        logger.info(
+            f"[FlexKV] Eventfd socket path configured{self._rank_label}: "
+            f"socket={self.layerwise_eventfd_socket}, "
+            f"layerwise_transfer={self.enable_layerwise_transfer}")
         self.layerwise_eventfd_connect_max_retries = max(
             360,
             int(os.getenv("FLEXKV_LAYERWISE_EVENTFD_CONNECT_MAX_RETRIES", "0")),
@@ -196,14 +249,47 @@ class FlexKVConnector:
 
         self._init_layer_transfer_components()
 
-        if self.rank == 0:
+        if self.tp_rank == 0:
+            wait_count = 0
             while not self.kv_manager.is_ready():
-                time.sleep(3)
-                logger.info("[FlexKV] Waiting for FlexKV to be ready...")
-            logger.info("[FlexKV] FlexKV is ready")
+                time.sleep(10)
+                wait_count += 1
+                # Collect diagnostic info for debugging
+                diag_parts = []
+                # Check IPC socket file existence
+                gpu_port = self.flexkv_config.gpu_register_port
+                if gpu_port.startswith("ipc://"):
+                    ipc_path = gpu_port[len("ipc://"):]
+                    ipc_exists = os.path.exists(ipc_path)
+                    diag_parts.append(f"ipc_socket={ipc_path} exists={ipc_exists}")
+                # Check TransferManager subprocess status
+                task_engine = getattr(self.kv_manager, 'kv_task_engine', None)
+                if task_engine is not None:
+                    for i, th in enumerate(getattr(task_engine, 'transfer_handles', [])):
+                        handle = getattr(th, '_handle', None)
+                        if handle is not None:
+                            # InterProcessHandle: check start_event, ready_event, process alive
+                            start_evt = getattr(handle, 'start_event', None)
+                            ready_evt = getattr(handle, 'ready_event', None)
+                            proc = getattr(handle, 'process', None)
+                            parts = []
+                            if start_evt is not None:
+                                parts.append(f"started={start_evt.is_set()}")
+                            if ready_evt is not None:
+                                parts.append(f"ready={ready_evt.is_set()}")
+                            if proc is not None:
+                                parts.append(f"alive={proc.is_alive()}")
+                            if parts:
+                                diag_parts.append(f"transfer_handle[{i}]: {', '.join(parts)}")
+                diag_str = "; ".join(diag_parts) if diag_parts else "no diagnostics available"
+                logger.info(
+                    f"[FlexKV] Waiting for FlexKV to be ready{self._rank_label}... "
+                    f"(waited {wait_count * 10}s, {diag_str})"
+                )
+            logger.info(f"[FlexKV] FlexKV is ready{self._rank_label}")
 
         logger.info(
-            f"[FlexKV] Connector initialized for rank {self.rank}, "
+            f"[FlexKV] Connector initialized{self._rank_label}: "
             f"layerwise_transfer={self.enable_layerwise_transfer}"
         )
 
@@ -212,12 +298,12 @@ class FlexKVConnector:
         if not self.enable_layerwise_transfer:
             self.layer_done_counter = None
             self._worker_connected = False
-            logger.info(f"[FlexKV] Rank {self.rank}: Layerwise transfer disabled")
+            logger.info(f"[FlexKV] Layerwise transfer disabled{self._rank_label}")
             return
 
         self.layer_done_counter = FlexKVLayerDoneCounter(self.num_layers)
         self._send_eventfds_to_worker()
-        logger.info(f"[FlexKV] Rank {self.rank}: Initialized layerwise transfer")
+        logger.info(f"[FlexKV] Initialized layerwise transfer{self._rank_label}")
 
     def _send_eventfds_to_worker(
         self,
@@ -231,41 +317,77 @@ class FlexKVConnector:
         """
         if max_retries is None:
             max_retries = self.layerwise_eventfd_connect_max_retries
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        logger.info(
+            f"[FlexKV] Attempting eventfd connection{self._rank_label}: "
+            f"socket={self.layerwise_eventfd_socket}, max_retries={max_retries}")
 
-        # Retry until worker is ready
+        # Retry until worker is ready.
+        sock = None
         for attempt in range(max_retries):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sock.connect(self.layerwise_eventfd_socket)
-                logger.info(f"[FlexKV] Rank {self.rank}: Connected to worker socket")
+                logger.info(
+                    f"[FlexKV] Eventfd connected{self._rank_label}: "
+                    f"socket={self.layerwise_eventfd_socket}, "
+                    f"attempts={attempt + 1}")
                 break
-            except (FileNotFoundError, ConnectionRefusedError):
+            except (FileNotFoundError, ConnectionRefusedError) as e:
+                sock.close()
+                sock = None
                 if attempt == max_retries - 1:
-                    sock.close()
+                    logger.error(
+                        f"[FlexKV] Eventfd connection failed{self._rank_label}: "
+                        f"socket={self.layerwise_eventfd_socket}, "
+                        f"attempts={max_retries}, error={type(e).__name__}")
                     raise RuntimeError(
-                        f"[FlexKV] Rank {self.rank}: Failed to connect after {max_retries} attempts"
+                        f"[FlexKV] Failed to connect to eventfd socket "
+                        f"{self.layerwise_eventfd_socket} after {max_retries} attempts"
                     )
                 if attempt % 10 == 0:
-                    logger.info(f"[FlexKV] Rank {self.rank}: Worker not ready, retrying...")
+                    socket_exists = os.path.exists(self.layerwise_eventfd_socket)
+                    logger.debug(
+                        f"[FlexKV] Eventfd connect retry{self._rank_label}: "
+                        f"socket={self.layerwise_eventfd_socket}, "
+                        f"attempt={attempt + 1}/{max_retries}, "
+                        f"error={type(e).__name__}, socket_exists={socket_exists}")
                 time.sleep(retry_interval)
 
         try:
             # Send metadata: tp_rank, tp_size, num_layers, num_counters
             num_counters = self.layer_done_counter.num_counters
-            metadata = struct.pack("iiii", self.rank, self.tp_size, self.num_layers, num_counters)
+            metadata = struct.pack("iiii", self.tp_rank, self.tp_size, self.num_layers, num_counters)
             sock.sendall(metadata)
+            logger.debug(
+                f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
+                f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
+                f"num_layers={self.num_layers}, num_counters={num_counters}")
 
             # Send all eventfds for each counter set
             for counter_id in range(num_counters):
                 fds = self.layer_done_counter.events[counter_id].load_event_fds
                 send_fds(sock, fds, struct.pack("i", counter_id))
+                logger.debug(
+                    f"[FlexKV] Eventfd fds sent{self._rank_label}: "
+                    f"counter_id={counter_id}, num_fds={len(fds)}")
 
             self._worker_connected = True
-            logger.info(f"[FlexKV] Rank {self.rank}: Sent {num_counters} sets of eventfds")
+            logger.info(
+                f"[FlexKV] Eventfd setup complete{self._rank_label}: "
+                f"socket={self.layerwise_eventfd_socket}, "
+                f"counters={num_counters}, layers={self.num_layers}")
 
         except Exception as e:
-            sock.close()
-            raise RuntimeError(f"[FlexKV] Rank {self.rank}: Failed to send eventfds: {e}")
+            logger.error(
+                f"[FlexKV] Failed to send eventfds{self._rank_label}: "
+                f"socket={self.layerwise_eventfd_socket}, error={e}",
+                exc_info=True)
+            raise RuntimeError(
+                f"[FlexKV] Failed to send eventfds to {self.layerwise_eventfd_socket}: {e}"
+            )
+        finally:
+            if sock is not None:
+                sock.close()
 
     def register_layer_transfer_counter(self, kvcache) -> None:
         """Register layer done counter with the KV cache."""
@@ -278,7 +400,7 @@ class FlexKVConnector:
 
     def poll_store_tasks(self) -> tuple[List[int], List[int]]:
         """Non-blocking poll for completed/skipped store tasks (rank 0 only)."""
-        if self.rank != 0:
+        if self.tp_rank != 0:
             return [], []
 
         completed_req_ids = []
@@ -295,12 +417,16 @@ class FlexKVConnector:
 
     def store_kv_async(self, token_ids: List[int], kv_indices: torch.Tensor, req_id: int) -> int:
         """Store KV cache to FlexKV asynchronously. Returns task_id or -1 if skipped."""
-        if self.rank != 0:
+        if self.tp_rank != 0:
             return -1
 
         try:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            assert len(token_ids) == len(kv_indices)
+            assert len(token_ids) == len(kv_indices), (
+                f"len(token_ids)={len(token_ids)} != len(kv_indices)={len(kv_indices)}, "
+                f"req_id={req_id}, page_size={self.page_size}, "
+                f"kv_indices_shape={kv_indices.shape if hasattr(kv_indices, 'shape') else 'N/A'}"
+            )
 
             # Page-align token_ids and kv_indices BEFORE put_match so that
             # put_match allocates dst_block_ids consistent with the slot_mapping
@@ -331,7 +457,7 @@ class FlexKVConnector:
                 self.inflight_skipped_reqids.append(req_id)
                 return -1
         except Exception as e:
-            logger.error(f"[FlexKV] store_kv_async failed: {e}")
+            logger.error(f"[FlexKV] store_kv_async failed: {e}", exc_info=True)
             return -1
 
     def wait_task(self, task_id: int, timeout: float = 20.0) -> bool:
@@ -340,7 +466,7 @@ class FlexKVConnector:
             return True
 
         # Only tp0 has real tasks to wait for
-        if self.rank == 0:
+        if self.tp_rank == 0:
             try:
                 response = self.kv_manager.wait([task_id], timeout=timeout)
                 if task_id in response and response[task_id].status == KVResponseStatus.SUCCESS:
@@ -348,7 +474,7 @@ class FlexKVConnector:
                 else:
                     return False
             except Exception as e:
-                logger.error(f"FlexKV wait_task failed: {e}")
+                logger.error(f"FlexKV wait_task failed: {e}", exc_info=True)
                 return False
         else:
             # Other ranks don't have real tasks, so always return success
@@ -359,7 +485,7 @@ class FlexKVConnector:
         load_queue: List[FlexKVLoadOperation],
         producer_id: int = 0,
     ):
-        if self.rank != 0:
+        if self.tp_rank != 0:
             return 0
         
         task_ids = []
@@ -388,7 +514,7 @@ class FlexKVConnector:
         self,
         load_queue: List[FlexKVLoadOperation],
     ):   
-        if self.rank == 0:
+        if self.tp_rank == 0:
             task_ids = []
             slot_mappings = []
             
@@ -515,16 +641,22 @@ class FlexKVRadixCache(RadixCache):
         server_args,
         model_config: Optional[ModelConfig] = None,
         tp_size: int = 1,
-        rank: int = 0,
+        tp_rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         pp_size: int = 1,
         pp_rank: int = 0,
+        dp_size: int = 1,
+        dp_rank: int = 0,
     ):
-        self.rank = rank
+        self.tp_rank = tp_rank
         self.tp_group = tp_group
         self.tp_size = tp_size
         self.pp_size = pp_size if pp_size > 0 else 1
         self.pp_rank = pp_rank
+        # Normalise None to safe defaults (PP-only mode may pass None)
+        dp_rank = dp_rank if dp_rank is not None else 0
+        dp_size = dp_size if dp_size is not None else 1
+        self.dp_rank = dp_rank
 
         self.global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if tp_group is not None and tp_size > 1:
@@ -574,13 +706,15 @@ class FlexKVRadixCache(RadixCache):
             sgl_config=model_config,
             page_size=params.page_size,
             tp_size=tp_size,
-            tp_rank=rank,
+            tp_rank=tp_rank,
             tp_group=tp_group,
             kv_caches=kv_caches,
             indexer_buffers=indexer_buffers,
             num_local_layers=num_local_layers,
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
+            dp_size=dp_size,
+            dp_rank=self.dp_rank,
         )
 
         self.layer_done_counter = self.flexkv_connector.layer_done_counter
@@ -594,7 +728,7 @@ class FlexKVRadixCache(RadixCache):
         super().__init__(params)
 
     def reset(self):
-        if self.rank == 0:
+        if self.tp_rank == 0:
             for task_id in list(self.flexkv_connector.inflight_taskid2reqid.keys()):
                 self.flexkv_connector.wait_task(task_id)
 
@@ -638,7 +772,7 @@ class FlexKVRadixCache(RadixCache):
         # Query FlexKV to see what tokens are available (match only, no transfer)
         flexkv_hit_length = 0
         flexkv_task_id = -1
-        if self.rank == 0:
+        if self.tp_rank == 0:
             token_ids_np = np.array(key.token_ids, dtype=np.int64)
             token_mask = torch.zeros(len(key), dtype=torch.bool)
             token_mask[value.numel():] = True  # Only check uncached tokens
@@ -863,7 +997,7 @@ class FlexKVRadixCache(RadixCache):
                 req_id=req.req_pool_idx,
             )
         except Exception as e:
-            logger.error(f"[FlexKV] Failed to store KV: {e}")
+            logger.error(f"[FlexKV] Failed to store KV: {e}", exc_info=True)
             return
 
         if req.req_pool_idx in self.inflight_reqid2node:
@@ -896,7 +1030,7 @@ class FlexKVRadixCache(RadixCache):
         # Use tuple instead of list to avoid unnecessary copy overhead
         remaining_reqids = tuple(self.inflight_reqid2node.keys())
 
-        if self.flexkv_connector.rank == 0:
+        if self.flexkv_connector.tp_rank == 0:
             task_ids = tuple(self.flexkv_connector.inflight_taskid2reqid.keys())
             for task_id in task_ids:
                 self.flexkv_connector.wait_task(task_id)
@@ -947,7 +1081,7 @@ class FlexKVRadixCache(RadixCache):
         self.writing_check()
         self.loading_check()
         # Avoid f-string construction when log level is not enabled
-        if self.rank == 0 and self.sts_total_seq_len > 0 and logger.isEnabledFor(logging.INFO):
+        if self.tp_rank == 0 and self.sts_total_seq_len > 0 and logger.isEnabledFor(logging.INFO):
             logger.info(
                 "[FlexKV stats] total_seq_len=%d, gpu_cache_len=%d, flexkv_cache_len=%d, "
                 "gpu_cache_ratio=%.4f, flexkv_cache_ratio=%.4f",
@@ -965,7 +1099,7 @@ class FlexKVRadixCache(RadixCache):
         # Broadcast to all ranks if using tensor-parallel group
         if self.tp_group is not None and self.tp_size > 1:
             payload = broadcast_pyobj(
-                [{'completed': completed, 'skipped': skipped}] if self.rank == 0 else [None],
+            [{'completed': completed, 'skipped': skipped}] if self.tp_rank == 0 else [None],
                 self.global_rank, self.tp_group, src=self.tp_src_rank
             )[0]
             to_release = payload['completed'] + payload['skipped']
