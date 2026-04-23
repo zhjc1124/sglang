@@ -494,6 +494,20 @@ class FlexKVConnector(BaseKVConnector):
         self._load_fkv_tids: List[int] = []
         # rid -> flexkv_task_id (prefetch in flight)
         self._ongoing_prefetches: Dict[str, int] = {}
+        # rid -> start time (for timeout detection)
+        self._prefetch_start_times: Dict[str, float] = {}
+        # rid -> page-aligned token count submitted for prefetch
+        self._prefetch_token_counts: Dict[str, int] = {}
+        # rid -> tokens loaded from storage (populated on completion, consumed by pop)
+        self._prefetch_loaded_tokens: Dict[str, int] = {}
+        self._prefetch_timeout: float = float(
+            os.environ.get("FLEXKV_PREFETCH_TIMEOUT", "30.0")
+        )
+        # Max total outstanding prefetches (queued in FlexKV + IO in-flight).
+        # Should be > FLEXKV_PREFETCH_MAX_INFLIGHT so the priority queue has tasks to sort.
+        self._max_concurrent_prefetch: int = int(
+            os.environ.get("FLEXKV_MAX_CONCURRENT_PREFETCH", "8")
+        )
         cache_cfg = self.flexkv_config.cache_config
         self._prefetch_enabled = bool(
             cache_cfg.enable_ssd
@@ -809,11 +823,25 @@ class FlexKVConnector(BaseKVConnector):
             return
         if not rid:
             return
+        # Deduplicate: skip if a prefetch for this rid is already in-flight
+        # (e.g. request was retracted and re-queued)
+        if rid in self._ongoing_prefetches:
+            return
+        # Limit total outstanding prefetches (queued + in-flight) to cap CPU block usage.
+        # Actual IO concurrency is further controlled by FlexKV's priority queue
+        # (FLEXKV_PREFETCH_MAX_INFLIGHT).
+        if len(self._ongoing_prefetches) >= self._max_concurrent_prefetch:
+            return
 
         prefetch_task_id = -1
+        # Page-aligned token count — used as match_length for priority ordering
+        aligned_len = (len(token_ids) // self.page_size) * self.page_size if self.page_size > 1 else len(token_ids)
         if self.rank == 0:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            prefetch_task_id = self.kv_manager.prefetch_async(token_ids=token_ids_np)
+            prefetch_task_id = self.kv_manager.prefetch_async(
+                token_ids=token_ids_np,
+                match_length=aligned_len,
+            )
 
         if self.cp_cpu_group is not None and self.cp_size > 1:
             prefetch_task_id = broadcast_pyobj(
@@ -832,6 +860,10 @@ class FlexKVConnector(BaseKVConnector):
 
         if prefetch_task_id >= 0:
             self._ongoing_prefetches[rid] = prefetch_task_id
+            self._prefetch_start_times[rid] = time.monotonic()
+            # Record page-aligned token count for loaded_tokens tracking
+            aligned_len = (len(token_ids) // self.page_size) * self.page_size if self.page_size > 1 else len(token_ids)
+            self._prefetch_token_counts[rid] = aligned_len
 
     def check_prefetch_progress(self, rid: str) -> bool:
         if not self._prefetch_enabled:
@@ -841,19 +873,38 @@ class FlexKVConnector(BaseKVConnector):
         if prefetch_task_id < 0:
             return True
 
+        # Timeout guard: treat as done if prefetch has been running too long
+        start_time = self._prefetch_start_times.get(rid, 0)
+        if time.monotonic() - start_time > self._prefetch_timeout:
+            logger.warning(
+                "[FlexKV] prefetch for rid=%s timed out after %.1fs, treating as done",
+                rid,
+                self._prefetch_timeout,
+            )
+            self._ongoing_prefetches.pop(rid, None)
+            self._prefetch_start_times.pop(rid, None)
+            self._prefetch_token_counts.pop(rid, None)
+            # Timeout: no tokens considered loaded
+            self._prefetch_loaded_tokens[rid] = 0
+            return True
+
         is_completed = False
+        loaded_tokens = 0
         if self.rank == 0:
             completed = self.kv_manager.try_wait(task_ids=[prefetch_task_id])
             if prefetch_task_id in completed:
-                status = completed[prefetch_task_id].status
-                if status != KVResponseStatus.SUCCESS:
+                resp = completed[prefetch_task_id]
+                if resp.status != KVResponseStatus.SUCCESS:
                     logger.warning(
                         "[FlexKV] prefetch task %d for rid=%s finished with status=%s",
                         prefetch_task_id,
                         rid,
-                        status,
+                        resp.status,
                     )
                 is_completed = True
+                # Extract precise SSD→CPU loaded token count from return_mask
+                if resp.return_mask is not None:
+                    loaded_tokens = int(np.sum(resp.return_mask))
 
         if self.cp_cpu_group is not None and self.cp_size > 1:
             data = broadcast_pyobj(
@@ -874,18 +925,37 @@ class FlexKVConnector(BaseKVConnector):
 
         if is_completed:
             self._ongoing_prefetches.pop(rid, None)
+            self._prefetch_start_times.pop(rid, None)
+            self._prefetch_token_counts.pop(rid, None)
+            # Record precise tokens loaded from SSD→CPU (rank 0 has accurate count;
+            # other ranks get 0, which is fine — storage_hit_length is stats-only)
+            self._prefetch_loaded_tokens[rid] = loaded_tokens
         return is_completed
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-        # TODO: Implement this
-        return 0
+        """Pop and return the number of tokens loaded from storage for a request.
+
+        Returns 0 if no prefetch was done, was revoked, or timed out.
+        This should be called after check_prefetch_progress() returns True.
+        """
+        return self._prefetch_loaded_tokens.pop(rid, 0)
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_loads.pop(rid, None)
         prefetch_task_id = self._ongoing_prefetches.pop(rid, -1)
+        self._prefetch_start_times.pop(rid, None)
+        self._prefetch_token_counts.pop(rid, None)
+        self._prefetch_loaded_tokens.pop(rid, None)
         if self.rank == 0 and prefetch_task_id >= 0:
-            # Flexkv not support cancel prefetch task yet
-            pass
+            try:
+                self.kv_manager.cancel([prefetch_task_id])
+            except Exception:
+                # Best-effort cancel; already-submitted IO cannot be interrupted
+                logger.debug(
+                    "[FlexKV] cancel_prefetch: failed to cancel task %d for rid=%s",
+                    prefetch_task_id,
+                    rid,
+                )
 
     @property
     def layer_done_counter(self) -> Any:
@@ -902,6 +972,9 @@ class FlexKVConnector(BaseKVConnector):
                 self.kv_manager.cancel(pending_tids)
         self._pending_loads.clear()
         self._ongoing_prefetches.clear()
+        self._prefetch_start_times.clear()
+        self._prefetch_token_counts.clear()
+        self._prefetch_loaded_tokens.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()
         self._load_fkv_tids.clear()
