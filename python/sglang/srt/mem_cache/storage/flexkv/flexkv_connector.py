@@ -881,11 +881,19 @@ class FlexKVConnector(BaseKVConnector):
                 rid,
                 self._prefetch_timeout,
             )
-            self._ongoing_prefetches.pop(rid, None)
+            timed_out_task_id = self._ongoing_prefetches.pop(rid, -1)
             self._prefetch_start_times.pop(rid, None)
             self._prefetch_token_counts.pop(rid, None)
             # Timeout: no tokens considered loaded
             self._prefetch_loaded_tokens[rid] = 0
+            # Best-effort cancel on FlexKV side: succeeds if task is still
+            # queued (READY); no-op if already RUNNING (IO cannot be interrupted,
+            # but resources will be freed when IO completes naturally).
+            if self.rank == 0 and timed_out_task_id >= 0:
+                try:
+                    self.kv_manager.cancel([timed_out_task_id])
+                except Exception:
+                    pass
             return True
 
         is_completed = False
