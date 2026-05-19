@@ -99,6 +99,11 @@ class FlexKVConnector(BaseKVConnector):
 
         sglang_model_config = ModelConfig.from_server_args(server_args)
 
+        # Normalise dp_rank: plain-DP passes an int (0, 1, …), DP-Attention
+        # passes attn_dp_rank (also an int).  Guard against None in case the
+        # caller omits the argument or passes it explicitly as None.
+        _dp_rank: int = 0 if dp_rank is None else int(dp_rank)
+
         # ---- Initialize FlexKV config ----
         self.flexkv_config = FlexKVConfig.from_env()
         rank_info = self.flexkv_config.post_init_from_sglang_config(
@@ -107,7 +112,7 @@ class FlexKVConnector(BaseKVConnector):
             page_size=self.page_size,
             tp_rank=tp_rank,
             pp_rank=params.pp_rank,
-            dp_rank=dp_rank,
+            dp_rank=_dp_rank,
             attn_cp_rank=attn_cp_rank,
         )
 
@@ -130,6 +135,9 @@ class FlexKVConnector(BaseKVConnector):
         )
         logger.debug(
             f"[FlexKV] sync_context{self._rank_label}: "
+            f"dp={rank_info.dp_rank}/{model_config.dp_size}, "
+            f"dp_client_id={rank_info.dp_client_id}, "
+            f"total_gpus={model_config.total_gpus}, "
             f"is_sync_leader={self._sync_ctx.is_sync_leader}, "
             f"needs_sync={self._sync_ctx.needs_sync}, "
             f"is_pp_active={self._sync_ctx.is_pp_active}"
@@ -285,6 +293,8 @@ class FlexKVConnector(BaseKVConnector):
                     ipc_exists = os.path.exists(ipc_path)
                     diag_parts.append(f"ipc_socket={ipc_path} exists={ipc_exists}")
                 # Check TransferManager subprocess status
+                # In server_client_mode (attn_dp or multi-instance), kv_task_engine
+                # does not exist on the client side; skip this diagnostic.
                 task_engine = getattr(self.kv_manager, 'kv_task_engine', None)
                 if task_engine is not None:
                     for i, th in enumerate(getattr(task_engine, 'transfer_handles', [])):
@@ -949,24 +959,26 @@ class FlexKVConnector(BaseKVConnector):
                     )
 
                 # Phase 2: Send metadata + eventfds over the connected socket.
-                # UDS is node-local, so use _per_node TP rank/size so that
-                # LayerwiseWorker builds the correct eventfd tensor shape.
+                # UDS is node-local, so use effective_tp_rank/size (= cp_rank * tp_size + tp_rank)
+                # so that LayerwiseWorker can uniquely identify each GPU even when cp_size > 1.
+                # Using tp_rank_per_node would cause CP ranks to collide (both CP0 and CP1 have
+                # tp_rank_per_node=0..3), leaving half the GPUs unregistered.
                 num_counters = self._layer_done_counter.num_counters
                 model_config = self.flexkv_config.model_config
                 rank_info = self.rank_info
-                # Send 16-byte metadata: tp_rank_per_node, tp_size_per_node, num_layers, num_counters
+                # Send 16-byte metadata: effective_tp_rank, effective_tp_size_per_node, num_layers, num_counters
                 metadata = struct.pack(
                     "iiii",
-                    rank_info.tp_rank_per_node,
-                    model_config.tp_size_per_node,
+                    rank_info.effective_tp_rank,
+                    model_config.effective_tp_size_per_node,
                     rank_info.num_layers_per_pp_stage,
                     num_counters,
                 )
                 sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                    f"tp_rank_per_node={rank_info.tp_rank_per_node}, "
-                    f"tp_size_per_node={model_config.tp_size_per_node}, "
+                    f"effective_tp_rank={rank_info.effective_tp_rank}, "
+                    f"effective_tp_size_per_node={model_config.effective_tp_size_per_node}, "
                     f"num_layers={rank_info.num_layers_per_pp_stage}, num_counters={num_counters}"
                 )
 

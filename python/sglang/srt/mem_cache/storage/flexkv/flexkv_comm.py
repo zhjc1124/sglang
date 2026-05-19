@@ -5,13 +5,15 @@ import os
 import pickle
 import socket
 import struct
+from collections import deque
 from datetime import timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -22,25 +24,26 @@ CMD_STORE_COMPLETE = 5
 
 
 class FlexKVComm:
-    """FlexKV hierarchical communication on 3D topology (PP x CP x TP).
+    """FlexKV hierarchical communication on 4D topology
+    (PP × ATTN_DP × ATTN_CP × ATTN_TP).
 
     Public API: scatter, scatter_pp, barrier, all_reduce_min.
     Public read-only attributes: is_sync_leader, needs_sync, is_pp_active,
     is_pp_sender, is_pp_receiver.
 
-    Communication hierarchy (3 dimensions, fan-out / aggregate):
+    Communication hierarchy (fan-out / aggregate):
 
         Scatter (async):   PP_leader --isend--> PP_stage_leaders
-                                     --isend--> CP_ranks  (per PP stage)
-                                     --isend--> TP_ranks  (per CP group)
+                                     --isend--> ATTN_CP_ranks  (per PP stage)
+                                     --isend--> ATTN_TP_ranks  (per CP group)
 
-        AllReduce (sync):  TP group all_reduce
-                           -> CP group all_reduce
+        AllReduce (sync):  ATTN_TP group all_reduce
+                           -> ATTN_CP group all_reduce
                            -> PP P2P reduce (stage leaders)
                            -> bcast result back down
 
         scatter_pp (async): PP0 stage leader --isend--> PP1+ stage leaders
-        barrier (sync):     hierarchical barrier: TP -> CP -> PP
+        barrier (sync):     hierarchical barrier: ATTN_TP -> ATTN_CP -> PP
     """
 
     # ---- Tags for P2P scatter on world_cpu_group ----
@@ -61,11 +64,24 @@ class FlexKVComm:
     # adapts: it grows on stuck reaps (peer slow / asymmetric) and shrinks
     # back on clean reaps. Empty scatter payloads (~50B over loopback /
     # LAN) complete in <1ms, so PROBE=1ms is comfortable.
+    #
+    # Each call to ``scatter`` enqueues O(pp + cp + tp) Work objects, and
+    # the leader is the only producer per dimension, so backlog grows on
+    # the leader rank when peers post recv() late. The numbers below cap
+    # the reaper's main-thread cost while still bounding the queue:
+    #
+    #   * Steady-state ``len(_async_works) <= _REAP_HIGH_BASE``
+    #     means O(64KiB) of Python overhead per leader rank, negligible.
+    #   * Worst-case stuck ``len(_async_works) ~= _REAP_HIGH_MAX`` keeps
+    #     the queue under O(1MiB), which is fine for any real workload.
+    #   * Per call: at most ``_REAP_MAX_DRAIN`` wait() probes; happy-path
+    #     each is microseconds, stuck-path bails out after the first 1ms
+    #     timeout, so worst-case main-thread cost is ~1ms per scatter.
     _REAP_HIGH_BASE = 1024            # initial / minimum trigger watermark
-    _REAP_HIGH_MAX  = 32768           # cap on the adaptive watermark
-    _REAP_MAX_DRAIN = 512             # bound on works popped per reap call
+    _REAP_HIGH_MAX  = 8192            # cap on the adaptive watermark
+    _REAP_MAX_DRAIN = 256             # bound on works popped per reap call
     _REAP_PROBE     = timedelta(milliseconds=1)
-    _REAP_LOG_EVERY = 64              # sample-log every N reap calls
+    _REAP_LOG_EVERY = 256             # sample-log every N reap calls
 
     def __init__(
         self,
@@ -77,7 +93,10 @@ class FlexKVComm:
     ):
         model_config = rank_info.model_config
         self.world_rank = world_rank
-        self._async_works: List = []
+        # FIFO of pending isend Work objects. Use deque so that the
+        # head-of-queue popleft() done by ``_reap_completed_async_works``
+        # is O(1) instead of O(n) on a 8K-entry list.
+        self._async_works: Deque = deque()
         # Adaptive watermark for async-work reaping. Grows on stuck reaps
         # (peer asymmetric / slow), shrinks back to base on clean reaps.
         self._reap_high: int = self._REAP_HIGH_BASE
@@ -103,13 +122,22 @@ class FlexKVComm:
 
         # ---- Dimension sizes ----
         self.pp_size = model_config.pp_size
-        self.attn_tp_size = model_config.attn_tp_size
-        self.attn_cp_size = model_config.attn_cp_size
+        # dp_size: true DP shard count in both plain-DP and DP-Attention modes.
+        # plain DP:       dp_size == sglang dp_size (each shard is an independent
+        #                 scheduler process with its own KVManager).
+        # DP Attention:   dp_size == attn_dp_size == sglang dp_size (each attn-dp
+        #                 shard shares one CPU KV block, identified by dp_client_id).
+        # In both cases FlexKVComm does NOT scatter/barrier across dp shards;
+        # the dp dimension is handled at the KVManager routing level.
+        self.dp_size = model_config.dp_size
+        self.attn_tp_size = model_config.tp_size
+        self.attn_cp_size = model_config.cp_size
 
-        # ---- 3D coordinate ----
+        # ---- 4D coordinate ----
         self.pp_rank = rank_info.pp_rank
-        self.attn_tp_rank = rank_info.attn_tp_rank
-        self.attn_cp_rank = rank_info.attn_cp_rank
+        self.dp_rank = rank_info.dp_rank
+        self.attn_tp_rank = rank_info.tp_rank
+        self.attn_cp_rank = rank_info.cp_rank
 
         # ---- Role resolution ----
         self.is_pp_stage_leader = (self.attn_tp_rank == 0 and self.attn_cp_rank == 0)
@@ -117,45 +145,118 @@ class FlexKVComm:
             self.pp_rank == 0 and self.is_pp_stage_leader
         )
         self.is_pp_leader = (self.pp_rank == 0 and self.is_pp_stage_leader)
-        self.is_cp_leader = (self.attn_cp_rank == 0)
-        self.is_tp_leader = (self.attn_tp_rank == 0)
+        self.is_attn_cp_leader = (self.attn_cp_rank == 0)
+        self.is_attn_tp_leader = (self.attn_tp_rank == 0)
 
         # ---- Rank mapping for point-to-point scatter ----
-        # PP stage leaders: one per PP stage (tp=0, cp=0)
-        stride = self.attn_tp_size * self.attn_cp_size
-        self._pp_stage_leader_ranks = [s * stride for s in range(self.pp_size)]
-        # CP leaders: tp_rank=0 of each CP group within this PP stage
-        pp_stage_offset = self.pp_rank * stride
-        self._cp_leader_ranks = (
-            [pp_stage_offset + cp * self.attn_tp_size for cp in range(self.attn_cp_size)]
-            if self.attn_cp_size > 1 else []
-        )
-        # TP group ranks (pre-computed once)
+        # ATTN_TP group ranks (pre-computed once)
         if self.attn_tp_size > 1:
             if self.attn_tp_cpu_group is None:
                 raise RuntimeError(
                     f"[FlexKV] attn_tp_size={self.attn_tp_size} > 1 but "
-                    f"attn_tp_cpu_group is None — TP group is required for "
-                    f"scatter/collective operations"
+                    f"attn_tp_cpu_group is None — ATTN_TP group is required "
+                    f"for scatter/collective operations"
                 )
-            self._tp_group_ranks = [
+            self._attn_tp_group_ranks = [
                 dist.get_global_rank(self.attn_tp_cpu_group, i)
                 for i in range(self.attn_tp_cpu_group.size())
             ]
         else:
-            self._tp_group_ranks = []
-        # PP group ranks for scatter_pp (pre-computed once)
+            self._attn_tp_group_ranks = []
+
+        # PP group ranks for scatter_pp (pre-computed once).
+        # pp_cpu_group contains all ranks sharing the same (attn_dp, attn_cp, attn_tp)
+        # coordinate across all PP stages — i.e. the full PP column for this rank.
         self._pp_group_global_ranks = (
             [dist.get_global_rank(self.pp_cpu_group, i)
              for i in range(self.pp_cpu_group.size())]
             if self.pp_size > 1 and self.pp_cpu_group is not None else []
         )
-        # PP stage member ranks (all ranks in same PP stage)
-        self._pp_stage_member_ranks = list(
-            range(pp_stage_offset, pp_stage_offset + stride)
-        )
+
+        # PP stage leader ranks: attn_tp=0, attn_cp=0 of *this* ATTN_DP shard,
+        # one per PP stage.
+        #
+        # For is_pp_stage_leader ranks (attn_tp=0, attn_cp=0):
+        #   pp_cpu_group contains exactly the stage leaders of all PP stages
+        #   (same attn_dp/attn_cp/attn_tp coords across all PP stages), so
+        #   _pp_stage_leader_ranks == _pp_group_global_ranks.
+        #
+        # For non-stage-leader ranks (attn_tp>0 or attn_cp>0):
+        #   _pp_stage_leader_ranks is only used in _bcast_to_stage_members via
+        #   _pp_stage_leader_ranks[self.pp_rank] to find the stage leader to
+        #   receive from.  We compute this via _my_stage_leader_rank below.
+        if self._pp_group_global_ranks:
+            self._pp_stage_leader_ranks = list(self._pp_group_global_ranks)
+        else:
+            # pp_size == 1: only one stage, leader is self (if stage leader)
+            # or derived below (if not stage leader)
+            self._pp_stage_leader_ranks = [world_rank]
+
+        # _my_stage_leader_rank: world rank of the stage leader (attn_tp=0,
+        # attn_cp=0) in the same PP stage as this rank.
+        # - If this rank IS the stage leader, it's just world_rank.
+        # - Otherwise, find it via the attn_tp and attn_cp groups:
+        #   attn_tp_cpu_group rank 0 = attn_tp=0 peer in same (pp, dp, cp) group
+        #   attn_cp_cpu_group rank 0 = attn_cp=0 peer in same (pp, dp, tp=0) group
+        #   The stage leader is attn_cp_group.rank0's attn_tp_group.rank0.
+        if self.is_pp_stage_leader:
+            self._my_stage_leader_rank = world_rank
+        elif self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            # attn_cp_group is scoped to attn_tp=0 ranks within this PP stage.
+            # rank 0 of attn_cp_group is the stage leader (attn_cp=0, attn_tp=0).
+            self._my_stage_leader_rank = dist.get_global_rank(
+                self.attn_cp_cpu_group, 0
+            )
+        elif self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
+            # attn_cp_size == 1, so attn_cp=0 is always satisfied.
+            # attn_tp_group rank 0 is the stage leader (attn_tp=0).
+            self._my_stage_leader_rank = dist.get_global_rank(
+                self.attn_tp_cpu_group, 0
+            )
+        else:
+            # Both attn_tp_size == 1 and attn_cp_size == 1: this rank IS the
+            # stage leader (covered by is_pp_stage_leader above).
+            self._my_stage_leader_rank = world_rank
+
+        # ATTN_CP leader ranks within this PP stage's ATTN_DP shard.
+        # attn_cp_cpu_group contains all CP ranks for this (pp, attn_dp, attn_tp=0)
+        # slice.  The leader of each CP group is the rank with attn_tp_rank == 0,
+        # which is the rank in attn_cp_cpu_group itself (since attn_cp_group is
+        # scoped to attn_tp=0 ranks).  We derive these from attn_cp_cpu_group.
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            self._attn_cp_leader_ranks = [
+                dist.get_global_rank(self.attn_cp_cpu_group, i)
+                for i in range(self.attn_cp_cpu_group.size())
+            ]
+        else:
+            self._attn_cp_leader_ranks = []
+
+        # PP stage member ranks: ranks that the stage leader directly sends to
+        # in _bcast_to_stage_members.  We use a two-level fan-out:
+        #   Level 1 (stage leader sends to):
+        #     - attn_tp_group_ranks (same CP group, attn_tp > 0)
+        #     - attn_cp_leader_ranks (other CP groups, attn_tp = 0)
+        #   Level 2 (each CP leader sends to its own attn_tp members):
+        #     - handled inside _bcast_to_stage_members by CP leaders
+        # So _pp_stage_member_ranks = attn_tp_group_ranks + attn_cp_leader_ranks
+        # (excluding self).
+        _direct_members: set = set()
+        if self._attn_tp_group_ranks:
+            _direct_members.update(self._attn_tp_group_ranks)
+        if self._attn_cp_leader_ranks:
+            _direct_members.update(self._attn_cp_leader_ranks)
+        _direct_members.discard(world_rank)
+        self._pp_stage_member_ranks = sorted(_direct_members)
 
         # ---- Whether sync is needed (any dimension > 1) ----
+        # NOTE: dp_size is intentionally excluded here.
+        # In both plain-DP and DP-Attention modes, each DP shard runs its own
+        # independent KVManager (identified by
+        #   dp_client_id = instance_id * dp_size + dp_rank
+        # ) via server_client_mode.  The DP dimension is therefore handled at
+        # the KVManager routing level, not via FlexKVComm scatter/barrier.
+        # FlexKVComm only synchronises within a single DP shard across the
+        # (PP × CP × TP) sub-topology.
         self.needs_sync = (self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1)
 
         # ==================================================================
@@ -182,11 +283,23 @@ class FlexKVComm:
             self.is_pp_receiver and self.is_cross_node_pp
         )
 
+        # Ensure _DpGatheredBufferWrapper._dp_max_padding has a default value
+        # before any collective operation (e.g. all_reduce_min called during
+        # FlexKV connector init) can indirectly trigger is_allocation_symmetric()
+        # → is_dp_max_padding() → cls._dp_max_padding on PP non-first-stage
+        # schedulers, where set_dp_buffer_len() has not yet been called.
+        # Default True is safe: it makes is_allocation_symmetric() return True
+        # (symmetric allocation assumed), which is the correct conservative
+        # behaviour before the first forward pass sets the real value.
+        if not hasattr(_DpGatheredBufferWrapper, "_dp_max_padding"):
+            _DpGatheredBufferWrapper._dp_max_padding = True
+
         logger.info(
             f"[FlexKV] Comm init: rank={world_rank}, "
             f"pp={self.pp_rank}/{self.pp_size}, "
-            f"tp={self.attn_tp_rank}/{self.attn_tp_size}, "
-            f"cp={self.attn_cp_rank}/{self.attn_cp_size}, "
+            f"dp={self.dp_rank}/{self.dp_size}, "
+            f"attn_tp={self.attn_tp_rank}/{self.attn_tp_size}, "
+            f"attn_cp={self.attn_cp_rank}/{self.attn_cp_size}, "
             f"sync_leader={self.is_sync_leader}, "
             f"stage_leader={self.is_pp_stage_leader}, "
             f"is_cross_node_pp={self.is_cross_node_pp}, "
@@ -198,12 +311,12 @@ class FlexKVComm:
     # ==================================================================
 
     def scatter(self, data: Any, blocking: bool = False) -> Any:
-        """Hierarchical scatter: PP -> CP -> TP (async isend).
+        """Hierarchical scatter: PP -> ATTN_CP -> ATTN_TP (async isend).
 
         Fan-out in 3 stages, each uses isend/irecv on world_cpu_group:
           1. PP: sync_leader -> each PP stage's stage_leader
-          2. CP: each stage's cp_leader -> other CP ranks in same stage
-          3. TP: each CP group's tp_leader -> other TP ranks
+          2. ATTN_CP: each stage's attn_cp_leader -> other ATTN_CP ranks
+          3. ATTN_TP: each CP group's attn_tp_leader -> other ATTN_TP ranks
         """
         # Stage 1: PP scatter (sync_leader -> stage leaders)
         if self.pp_size > 1 and self.is_pp_stage_leader:
@@ -212,18 +325,18 @@ class FlexKVComm:
                 self.is_pp_leader, self._TAG_PP, blocking,
             )
 
-        # Stage 2: CP scatter (cp_leader -> other CP leaders in same PP stage)
-        if self._cp_leader_ranks:
+        # Stage 2: ATTN_CP scatter (attn_cp_leader -> other CP ranks in same PP stage)
+        if self._attn_cp_leader_ranks:
             data = self._scatter_group(
-                data, self._cp_leader_ranks,
-                self.is_cp_leader, self._TAG_CP, blocking,
+                data, self._attn_cp_leader_ranks,
+                self.is_attn_cp_leader, self._TAG_CP, blocking,
             )
 
-        # Stage 3: TP scatter (tp_leader -> other TP ranks)
-        if self._tp_group_ranks:
+        # Stage 3: ATTN_TP scatter (attn_tp_leader -> other TP ranks)
+        if self._attn_tp_group_ranks:
             data = self._scatter_group(
-                data, self._tp_group_ranks,
-                self.is_tp_leader, self._TAG_TP, blocking,
+                data, self._attn_tp_group_ranks,
+                self.is_attn_tp_leader, self._TAG_TP, blocking,
             )
 
         return data
@@ -233,7 +346,7 @@ class FlexKVComm:
 
         Only PP stage leaders participate. Non-leaders are no-ops.
         """
-        if not self._pp_group_global_ranks:
+        if not self._pp_group_global_ranks or not self.is_pp_stage_leader:
             return data
         is_leader = (self._pp_group_global_ranks[0] == self.world_rank)
         return self._scatter_group(
@@ -242,13 +355,13 @@ class FlexKVComm:
         )
 
     def all_reduce_min(self, value: int) -> int:
-        """Hierarchical all-reduce MIN across TP, CP, and PP dimensions.
+        """Hierarchical all-reduce MIN across ATTN_TP, ATTN_CP, and PP.
 
         Every rank participates in each collective layer it belongs to:
-          Layer 1  TP all_reduce   all attn_tp group members
-          Layer 2  CP all_reduce   all attn_cp group members
-          Layer 3  PP P2P reduce   only PP stage leaders
-          Layer 4  bcast result    stage leaders -> non-stage-leaders
+          Layer 1  ATTN_TP all_reduce   all attn_tp group members
+          Layer 2  ATTN_CP all_reduce   all attn_cp group members
+          Layer 3  PP P2P reduce        only PP stage leaders
+          Layer 4  bcast result         stage leaders -> non-stage-leaders
         """
         logger.debug(
             f"[FlexKV] all_reduce_min rank={self.world_rank} value={value}"
@@ -256,11 +369,11 @@ class FlexKVComm:
 
         tensor = torch.tensor(value, dtype=torch.int64)
 
-        # Layer 1: TP all_reduce
+        # Layer 1: ATTN_TP all_reduce
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
 
-        # Layer 2: CP all_reduce
+        # Layer 2: ATTN_CP all_reduce
         if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.attn_cp_cpu_group)
 
@@ -268,8 +381,11 @@ class FlexKVComm:
         if self.pp_size > 1 and self.is_pp_stage_leader:
             self._pp_all_reduce_min_p2p(tensor)
 
-        # Layer 4: broadcast PP result to non-stage-leaders
-        if self.pp_size > 1:
+        # Layer 4: broadcast result to non-stage-leaders.
+        # Required whenever attn_cp_size > 1 (attn_tp>0 leaf ranks are outside
+        # the attn_cp_cpu_group and never see the CP-level all_reduce result)
+        # or pp_size > 1 (non-stage-leader ranks need the PP-reduced result).
+        if self.attn_cp_size > 1 or self.pp_size > 1:
             self._bcast_to_stage_members(tensor, self._TAG_AR_BCAST)
 
         result = tensor.item()
@@ -280,14 +396,14 @@ class FlexKVComm:
         return result
 
     def barrier(self):
-        """Hierarchical global barrier: TP -> CP -> PP -> bcast."""
+        """Hierarchical global barrier: ATTN_TP -> ATTN_CP -> PP -> bcast."""
         logger.debug(f"[FlexKV] barrier ENTER rank={self.world_rank}")
 
-        # Layer 1: TP barrier
+        # Layer 1: ATTN_TP barrier
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.barrier(group=self.attn_tp_cpu_group)
 
-        # Layer 2: CP barrier
+        # Layer 2: ATTN_CP barrier
         if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
             dist.barrier(group=self.attn_cp_cpu_group)
 
@@ -295,8 +411,10 @@ class FlexKVComm:
         if self.pp_size > 1 and self.is_pp_stage_leader:
             self._pp_barrier_p2p()
 
-        # Layer 4: broadcast PP barrier completion to non-stage-leaders
-        if self.pp_size > 1:
+        # Layer 4: broadcast barrier completion to non-stage-leaders.
+        # Same condition as all_reduce_min Layer 4: needed when attn_cp_size > 1
+        # so that attn_tp>0 leaf ranks are unblocked after the CP-level barrier.
+        if self.attn_cp_size > 1 or self.pp_size > 1:
             dummy = torch.tensor([0], dtype=torch.int64)
             self._bcast_to_stage_members(dummy, self._TAG_PP_BARRIER_BCAST)
 
@@ -346,15 +464,19 @@ class FlexKVComm:
     def _reap_completed_async_works(self):
         """Drain oldest completed isends with bounded main-thread cost.
 
-        gloo's Work.is_completed() does not auto-advance on poll, so a
-        pure-poll reaper leaks. Here we actively wait() the oldest works
+        gloo's ``Work.is_completed()`` does not auto-advance on poll, so a
+        pure-poll reaper leaks. Here we actively ``wait()`` the oldest works
         with a tiny timeout: on a symmetric channel the head of the
-        queue has been in flight for many seconds and its matching recv
-        is long posted, so wait() returns in microseconds. On timeout
-        (peer slow / asymmetric) we break immediately so the main thread
-        is never blocked, and widen the trigger watermark via exponential
+        queue has been in flight for many milliseconds and its matching
+        ``recv`` is long posted, so ``wait()`` returns in microseconds. On
+        timeout (peer slow / asymmetric) we bail out so the main thread is
+        never blocked, and widen the trigger watermark via exponential
         backoff. On a clean reap we shrink the watermark back toward the
         base. When the peer recovers we converge back to steady-state.
+
+        Safety net: once backlog exceeds ``_REAP_HIGH_MAX`` we stop
+        backing off and simply keep probing every call so memory cannot
+        grow without bound.
         """
         n = len(self._async_works)
         if n <= self._reap_high:
@@ -373,7 +495,7 @@ class FlexKVComm:
                 # likely to be ready. Bail out; next reap will retry.
                 stuck = True
                 break
-            self._async_works.pop(0)
+            self._async_works.popleft()
             drained += 1
 
         # Update counters (used for sampled summary log below).
@@ -382,8 +504,9 @@ class FlexKVComm:
         if stuck:
             self._reap_stuck_total += 1
 
-        # Adapt watermark. Log on every actual transition — these are
-        # rare and informative on their own.
+        # Adapt watermark. Once we hit MAX, stop growing it any further;
+        # the reaper will then try to drain on every call, keeping the
+        # backlog bounded even with a permanently-slow peer.
         prev_high = self._reap_high
         if stuck:
             self._reap_high = min(self._REAP_HIGH_MAX, self._reap_high * 2)
@@ -394,6 +517,14 @@ class FlexKVComm:
                 f"[FlexKV] reap watermark rank={self.world_rank} "
                 f"{prev_high}->{self._reap_high} "
                 f"(stuck={stuck} drained={drained} backlog={n})"
+            )
+
+        # Loud warning if we hit the safety ceiling — usually means the
+        # peer is permanently asymmetric and someone should investigate.
+        if n >= self._REAP_HIGH_MAX:
+            logger.warning(
+                f"[FlexKV] reap backlog at safety ceiling rank={self.world_rank} "
+                f"backlog={n} drained={drained} stuck={stuck}"
             )
 
         # Sampled summary every N calls so steady-state behavior is
@@ -444,17 +575,60 @@ class FlexKVComm:
     # ==================================================================
 
     def _bcast_to_stage_members(self, tensor: torch.Tensor, tag: int):
-        if not self.is_pp_stage_leader:
+        """Broadcast tensor from PP stage leader to all non-leader ranks.
+
+        Two-level fan-out to handle the full (ATTN_CP × ATTN_TP) space:
+          Level 1: stage leader (attn_cp=0, attn_tp=0) sends to:
+            - attn_tp peers (same CP group, attn_tp > 0)
+            - CP leaders of other CP groups (attn_cp > 0, attn_tp = 0)
+          Level 2: each CP leader (attn_cp > 0, attn_tp = 0) sends to:
+            - its own attn_tp peers (attn_tp > 0)
+
+        Non-stage-leader ranks receive from their respective leader:
+          - attn_tp > 0, attn_cp = 0: receive from stage leader
+          - attn_cp > 0, attn_tp = 0: receive from stage leader
+          - attn_cp > 0, attn_tp > 0: receive from their CP leader
+        """
+        if self.is_pp_stage_leader:
+            # Level 1: send to direct members (attn_tp peers + CP leaders)
+            for rank in self._pp_stage_member_ranks:
+                self._send_tensor(
+                    tensor, dst=rank, tag=tag, group=self._world_cpu_group,
+                )
+        elif not self.is_pp_stage_leader and self.is_attn_tp_leader and self.attn_cp_size > 1:
+            # CP leader (attn_cp > 0, attn_tp = 0):
+            # First receive from stage leader (Level 1), then forward to
+            # own attn_tp peers (Level 2).
             self._recv_tensor(
-                tensor, src=self._pp_stage_leader_ranks[self.pp_rank],
+                tensor, src=self._my_stage_leader_rank,
                 tag=tag, group=self._world_cpu_group,
             )
-        else:
-            for rank in self._pp_stage_member_ranks:
+            # Forward to own attn_tp peers
+            for rank in self._attn_tp_group_ranks:
                 if rank != self.world_rank:
                     self._send_tensor(
                         tensor, dst=rank, tag=tag, group=self._world_cpu_group,
                     )
+        elif not self.is_attn_tp_leader and self.attn_cp_size > 1:
+            # attn_cp > 0, attn_tp > 0: receive from own CP leader.
+            # _my_stage_leader_rank points to the stage leader (attn_cp=0),
+            # but we need the CP leader (attn_cp=this, attn_tp=0).
+            # The CP leader is attn_tp_group rank 0 (attn_tp=0 in same CP group).
+            # The CP leader is attn_tp_group rank 0 (attn_tp=0 in same CP group).
+            # attn_tp_size > 1 is guaranteed here: if attn_tp_size == 1 then
+            # attn_tp_rank == 0 always, so is_attn_tp_leader is True and this
+            # branch (not is_attn_tp_leader) is unreachable.
+            _cp_leader = dist.get_global_rank(self.attn_tp_cpu_group, 0)
+            self._recv_tensor(
+                tensor, src=_cp_leader,
+                tag=tag, group=self._world_cpu_group,
+            )
+        else:
+            # attn_tp > 0, attn_cp = 0: receive from stage leader.
+            self._recv_tensor(
+                tensor, src=self._my_stage_leader_rank,
+                tag=tag, group=self._world_cpu_group,
+            )
 
     # ==================================================================
     # PP-level P2P collectives (cross-node safe on world_cpu_group)

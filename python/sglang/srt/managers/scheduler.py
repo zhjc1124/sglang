@@ -809,7 +809,13 @@ class Scheduler(
                     params=params,
                     server_args=server_args,
                     tp_rank=self.tp_rank,
-                    dp_rank=self.dp_rank,
+                    # plain DP: self.dp_rank is the scheduler's DP shard index (0,1,…);
+                    #           self.attn_dp_rank is always 0 (not meaningful).
+                    # DP Attention: self.dp_rank is None; self.attn_dp_rank is the
+                    #           true DP shard index derived from tp_rank.
+                    # FlexKV stores this as RankInfo.dp_rank with ModelConfig.dp_size
+                    # = sglang_dp_size, giving a unique dp_client_id per shard.
+                    dp_rank=self.attn_dp_rank if server_args.enable_dp_attention else self.dp_rank,
                     attn_cp_rank=self.attn_cp_rank,
                     pp_group=self.pp_group,
                     attn_tp_group=self.attn_tp_group,
