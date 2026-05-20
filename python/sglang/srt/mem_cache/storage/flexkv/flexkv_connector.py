@@ -217,6 +217,7 @@ class FlexKVConnector(BaseKVConnector):
             self.flexkv_config.gpu_register_port,
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
+            pp_start_layer=rank_info.pp_start_layer,
             device_id=rank_info.local_rank,
         )
 
