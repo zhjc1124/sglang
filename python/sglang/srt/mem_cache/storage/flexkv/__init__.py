@@ -93,7 +93,24 @@ def _flexkv_factory(ctx):
     )
 
     if ctx.is_hybrid_ssm:
-        raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
+        # Hybrid SSM models (Qwen3.5/Kimi K3): use FlexKVHybridRadixCache
+        # wrapping UnifiedRadixCache with FULL + MAMBA components.
+        # UnifiedRadixCache handles GPU radix tree + mamba CoW/tombstone/
+        # checkpoint natively; FlexKVHybridRadixCache adds FlexKV L2/L3.
+        from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (
+            FlexKVHybridRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # P2-1: params is a per-call object, mutation is safe here
+        ctx.params.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        inner_cache = UnifiedRadixCache(ctx.params)
+        logger.info("[FlexKV] hybrid SSM: FlexKVHybridRadixCache(UnifiedRadixCache[FULL+MAMBA])")
+        return FlexKVHybridRadixCache(
+            inner_cache=inner_cache,
+            **common_kwargs,
+        )
 
     if ctx.is_hybrid_swa:
         from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (

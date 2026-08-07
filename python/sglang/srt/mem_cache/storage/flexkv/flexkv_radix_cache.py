@@ -232,6 +232,18 @@ class FlexKVRadixCache(RadixCache):
             key=RadixKey(token_ids_snap, key.extra_key, key.is_bigram),
             value_numel=device_len,
         )
+
+        # --- Mamba state L2/L3 lookup ---
+        if self.flexkv_connector.has_mamba:
+            mamba_hit = self.flexkv_connector.lookup_mamba_state(
+                token_ids=token_ids, rid=req.rid
+            )
+            if mamba_hit > 0:
+                logger.debug(
+                    "[FlexKV-Mamba] match_prefix: mamba hit=%d tokens for rid=%s",
+                    mamba_hit, req.rid,
+                )
+
         return MatchResult(
             device_indices=device_value,
             last_device_node=last_node,
@@ -329,6 +341,23 @@ class FlexKVRadixCache(RadixCache):
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
             )
+
+        # --- Mamba state L2/L3 restore (CoW) ---
+        if self.flexkv_connector.has_mamba:
+            mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
+            if mamba_pool_idx is not None and mamba_pool_idx >= 0:
+                token_ids = marker.key.raw_token_ids()
+                with torch.cuda.stream(self.load_stream):
+                    restored = self.flexkv_connector.retrieve_mamba_state(
+                        token_ids=token_ids,
+                        mamba_pool_idx=mamba_pool_idx,
+                    )
+                    if restored:
+                        logger.debug(
+                            "[FlexKV-Mamba] restored mamba state for rid=%s slot=%d",
+                            req.rid, mamba_pool_idx,
+                        )
+
         return result
 
     def _allocate_and_load(
@@ -456,6 +485,17 @@ class FlexKVRadixCache(RadixCache):
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+
+        # --- Mamba state L2/L3 store ---
+        if self.flexkv_connector.has_mamba:
+            mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
+            if mamba_pool_idx is not None and mamba_pool_idx >= 0:
+                with torch.cuda.stream(self.store_stream):
+                    self.flexkv_connector.store_mamba_state(
+                        rid=req.rid,
+                        token_ids=list(token_ids),
+                        mamba_pool_idx=mamba_pool_idx,
+                    )
 
     # ------------------------------------------------------------------
     # evict + completion draining
