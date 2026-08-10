@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 class _LoadMarker:
     key: RadixKey
     device_length: int
+    mamba_hit_length: int = 0  # tokens covered by mamba state checkpoint (<= device_length)
 
 
 @dataclass
@@ -188,6 +189,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._load_markers[params.req.rid] = _LoadMarker(
             key=RadixKey(snapshot, key.extra_key, key.is_bigram),
             device_length=device_length,
+            mamba_hit_length=mamba_hit if self.flexkv_connector.has_mamba else 0,
         )
         return result._replace(
             last_host_node=result.last_device_node,
@@ -268,6 +270,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             if mamba_pool_idx is not None and mamba_pool_idx >= 0:
                 try:
                     token_ids_mamba = marker.key.raw_token_ids()
+                    # If mamba state covers fewer tokens than token KV,
+                    # retrieve using the shorter prefix (mamba boundary)
+                    mamba_hit = marker.mamba_hit_length
+                    if mamba_hit > 0 and mamba_hit < len(token_ids_mamba):
+                        token_ids_mamba = token_ids_mamba[:mamba_hit]
                     with torch.cuda.stream(self.load_stream):
                         restored = self.flexkv_connector.retrieve_mamba_state(
                             token_ids=token_ids_mamba,
@@ -275,9 +282,14 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                         )
                     self.load_stream.synchronize()  # P1-3: ensure H2D complete before forward
                     if restored:
+                        # Set recompute boundary: scheduler must recompute
+                        # linear attention layers from mamba_hit to device_length
+                        if mamba_hit > 0 and mamba_hit < marker.device_length:
+                            req._flexkv_mamba_recompute_seqlen = mamba_hit
                         logger.debug(
-                            "[FlexKV-Mamba] restored mamba state rid=%s slot=%d",
-                            req.rid, mamba_pool_idx,
+                            "[FlexKV-Mamba] restored mamba state rid=%s slot=%d mamba_hit=%d device_len=%d recompute=%s",
+                            req.rid, mamba_pool_idx, mamba_hit, marker.device_length,
+                            getattr(req, "_flexkv_mamba_recompute_seqlen", None),
                         )
                 except Exception as exc:
                     logger.debug("[FlexKV-Mamba] retrieve in init_load_back: %s", exc)
