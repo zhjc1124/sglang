@@ -473,13 +473,16 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             except Exception:
                 pass
 
+        # Store to FlexKV CPU BEFORE inner cache donates/frees the GPU slot.
+        # This ensures the CPU int8 copy is initiated before the GPU donate
+        # eviction can happen — no eviction callback needed (§2.4 design).
+        self._store_prefix(req, token_ids)
+
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
         self._commit_restore(req)
         if not is_insert:
             self._decode_tracking.pop(req.rid, None)
             return
-
-        self._store_prefix(req, token_ids)
 
         # radix_branch: store mamba checkpoint at branch point + mark high priority
         if branch_token_ids and self.flexkv_connector.has_mamba:
