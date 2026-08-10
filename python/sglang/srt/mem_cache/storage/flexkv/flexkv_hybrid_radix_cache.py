@@ -264,14 +264,14 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         req.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
 
-        # --- Mamba state L2/L3 restore (CoW) ---
+        # --- Mamba state L2/L3 restore (CoW, deferred execution) ---
+        # Retrieve + H2D copy on load_stream, then make the default (forward)
+        # stream wait for it — CPU does NOT block on synchronize.
         if self.flexkv_connector.has_mamba:
             mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
             if mamba_pool_idx is not None and mamba_pool_idx >= 0:
                 try:
                     token_ids_mamba = marker.key.raw_token_ids()
-                    # If mamba state covers fewer tokens than token KV,
-                    # retrieve using the shorter prefix (mamba boundary)
                     mamba_hit = marker.mamba_hit_length
                     if mamba_hit > 0 and mamba_hit < len(token_ids_mamba):
                         token_ids_mamba = token_ids_mamba[:mamba_hit]
@@ -280,10 +280,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                             token_ids=token_ids_mamba,
                             mamba_pool_idx=mamba_pool_idx,
                         )
-                    self.load_stream.synchronize()  # P1-3: ensure H2D complete before forward
+                    # GPU-side wait: forward stream waits for H2D copy.
+                    # CPU returns immediately — no synchronize, no blocking.
+                    torch.cuda.current_stream().wait_stream(self.load_stream)
                     if restored:
-                        # Set recompute boundary: scheduler must recompute
-                        # linear attention layers from mamba_hit to device_length
                         if mamba_hit > 0 and mamba_hit < marker.device_length:
                             req._flexkv_mamba_recompute_seqlen = mamba_hit
                         logger.debug(
