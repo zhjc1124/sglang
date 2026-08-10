@@ -122,7 +122,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self.load_stream = torch.cuda.Stream()
 
         # decode_interval: track running requests for periodic checkpoint
-        self._decode_checkpoint_interval = 256  # tokens between decode checkpoints
+        self._decode_checkpoint_interval = int(os.environ.get("FLEXKV_MAMBA_DECODE_INTERVAL", "256"))
+        self._mamba_chunk_size = int(os.environ.get("FLEXKV_MAMBA_CHUNK_SIZE", "1"))  # align checkpoints to this boundary
         self._decode_tracking: dict[str, tuple] = {}  # rid → (req, mamba_pool_idx, last_ckpt_len)
     def reset(self) -> None:
         # FlexKV still owns references to GPU source/destination slots while an
@@ -613,7 +614,13 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 continue
             if current_len - last_ckpt_len < self._decode_checkpoint_interval:
                 continue
-            token_ids = list(req.origin_input_ids[:]) + list(req.output_ids[:])
+            # Align checkpoint to chunk boundary (like sglang mamba_cache_chunk_size)
+            if self._mamba_chunk_size > 1:
+                aligned_len = (current_len // self._mamba_chunk_size) * self._mamba_chunk_size
+                if aligned_len <= last_ckpt_len:
+                    continue  # not enough new tokens past the aligned boundary
+                current_len = aligned_len
+            token_ids = (list(req.origin_input_ids[:]) + list(req.output_ids[:]))[:current_len]
             try:
                 with torch.cuda.stream(self.store_stream):
                     self.flexkv_connector.store_mamba_state(
