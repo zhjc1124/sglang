@@ -481,9 +481,17 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         self._store_prefix(req, token_ids)
 
-        # radix_branch: mark branch point checkpoint as high priority
+        # radix_branch: store mamba checkpoint at branch point + mark high priority
         if branch_token_ids and self.flexkv_connector.has_mamba:
             try:
+                mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
+                if mamba_pool_idx is not None and mamba_pool_idx >= 0:
+                    with torch.cuda.stream(self.store_stream):
+                        self.flexkv_connector.store_mamba_state(
+                            rid=req.rid,
+                            token_ids=branch_token_ids,
+                            mamba_pool_idx=mamba_pool_idx,
+                        )
                 mamba_conn = self.flexkv_connector._mamba_connector
                 if mamba_conn is not None:
                     mamba_conn.mark_branch_point(branch_token_ids)
@@ -497,12 +505,22 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._inner_cache.cache_unfinished_req(req, **kwargs)
         self._commit_restore(req)
 
-        # A chunk boundary is not a reusable request boundary and its state may
-        # still be changing. The non-chunked call marks prefill completion, when
-        # DSv4's SWA/compress state exactly describes the prompt prefix.
-        if kwargs.get("chunked", False):
+        fill_ids = list(req.get_fill_ids())
+        # chunk_boundary: store mamba state at chunk boundary for resumption
+        if kwargs.get("chunked", False) and self.flexkv_connector.has_mamba:
+            try:
+                mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
+                if mamba_pool_idx is not None and mamba_pool_idx >= 0 and fill_ids:
+                    with torch.cuda.stream(self.store_stream):
+                        self.flexkv_connector.store_mamba_state(
+                            rid=req.rid,
+                            token_ids=fill_ids,
+                            mamba_pool_idx=mamba_pool_idx,
+                        )
+            except Exception:
+                pass
             return
-        self._store_prefix(req, list(req.get_fill_ids()))
+        self._store_prefix(req, fill_ids)
 
     def _store_prefix(self, req: Req, token_ids: Sequence[int]) -> None:
         """Store a page-aligned prefix and its exact SWA/state snapshot."""
