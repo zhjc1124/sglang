@@ -123,12 +123,13 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         # Write policy: write_through (default, proactive D2H on cache_finished_req)
         # or write_back (deferred D2H, store_kv called lazily before eviction)
-        self._write_policy = os.environ.get("FLEXKV_WRITE_POLICY", "write_through")
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        self._write_policy = GLOBAL_CONFIG_FROM_ENV.write_policy
         self._pending_writeback: list = []  # deferred store items for write_back mode
 
         # decode_interval: track running requests for periodic checkpoint
-        self._decode_checkpoint_interval = int(os.environ.get("FLEXKV_MAMBA_DECODE_INTERVAL", "256"))
-        self._mamba_chunk_size = int(os.environ.get("FLEXKV_MAMBA_CHUNK_SIZE", "1"))  # align checkpoints to this boundary
+        self._decode_checkpoint_interval = GLOBAL_CONFIG_FROM_ENV.mamba_decode_interval
+        self._mamba_chunk_size = GLOBAL_CONFIG_FROM_ENV.mamba_chunk_size
         self._decode_tracking: dict[str, tuple] = {}  # rid → (req, mamba_pool_idx, last_ckpt_len)
     def reset(self) -> None:
         # FlexKV still owns references to GPU source/destination slots while an
