@@ -121,11 +121,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
 
-        # Write policy: write_through (default, proactive D2H on cache_finished_req)
-        # or write_back (deferred D2H, store_kv called lazily before eviction)
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
-        self._write_policy = GLOBAL_CONFIG_FROM_ENV.write_policy
-        self._pending_writeback: list = []  # deferred store items for write_back mode
         self._deferred_mamba_restores: list = []  # batch CoW: (req, token_ids, idx, mamba_hit, device_len)
 
         # decode_interval: track running requests for periodic checkpoint
@@ -466,12 +462,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 pass
 
         # Store to FlexKV CPU BEFORE inner cache donates/frees the GPU slot.
-        # write_through (default): proactive D2H immediately.
-        # write_back: defer to _flush_pending_writeback (called from evict/check_hicache_events).
-        if self._write_policy == "write_through":
-            self._store_prefix(req, token_ids)
-        else:
-            self._pending_writeback.append((req, list(token_ids)))
+        self._store_prefix(req, token_ids)
 
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
         self._commit_restore(req)
@@ -587,23 +578,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
         del req._flexkv_swa_evicted_seqlen
 
-    def _flush_pending_writeback(self) -> None:
-        """Process deferred store_kv items (write_back mode).
-
-        Called from evict / check_hicache_events to lazily create CPU copies
-        before GPU blocks are freed. Skips items whose GPU blocks are already
-        freed (node evicted from inner cache).
-        """
-        if not self._pending_writeback:
-            return
-        pending = self._pending_writeback
-        self._pending_writeback = []
-        for req, token_ids in pending:
-            try:
-                self._store_prefix(req, token_ids)
-            except Exception as exc:
-                logger.debug("[FlexKV] write_back flush failed: %s", exc)
-
     def _flush_deferred_mamba_restores(self) -> None:
         """Batch-process deferred mamba CoW restores.
 
@@ -631,13 +605,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         self._flush_deferred_mamba_restores()  # batch CoW before eviction
-        self._flush_pending_writeback()  # write_back: D2H before GPU free
         self._drain_completed_stores()
         return self._inner_cache.evict(params)
 
     def check_hicache_events(self) -> None:
         self._flush_deferred_mamba_restores()  # batch CoW before forward
-        self._flush_pending_writeback()  # write_back: opportunistic D2H
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
         # decode_interval: periodic checkpoint during decode
