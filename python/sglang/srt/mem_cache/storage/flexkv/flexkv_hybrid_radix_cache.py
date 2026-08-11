@@ -129,7 +129,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         # decode_interval: track running requests for periodic checkpoint
         self._decode_checkpoint_interval = GLOBAL_CONFIG_FROM_ENV.mamba_decode_interval
-        self._mamba_chunk_size = GLOBAL_CONFIG_FROM_ENV.mamba_chunk_size
+        self._mamba_chunk_size = getattr(server_args, "mamba_cache_chunk_size", 1)
         self._decode_tracking: dict[str, tuple] = {}  # rid → (req, mamba_pool_idx, last_ckpt_len)
     def reset(self) -> None:
         # FlexKV still owns references to GPU source/destination slots while an
