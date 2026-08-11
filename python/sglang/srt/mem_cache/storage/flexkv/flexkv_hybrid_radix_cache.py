@@ -126,6 +126,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
         self._write_policy = GLOBAL_CONFIG_FROM_ENV.write_policy
         self._pending_writeback: list = []  # deferred store items for write_back mode
+        self._deferred_mamba_restores: list = []  # batch CoW: (req, token_ids, idx, mamba_hit, device_len)
 
         # decode_interval: track running requests for periodic checkpoint
         self._decode_checkpoint_interval = GLOBAL_CONFIG_FROM_ENV.mamba_decode_interval
@@ -271,35 +272,19 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         req.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
 
-        # --- Mamba state L2/L3 restore (CoW, deferred execution) ---
-        # Retrieve + H2D copy on load_stream, then make the default (forward)
-        # stream wait for it — CPU does NOT block on synchronize.
+        # --- Mamba state L2/L3 restore (deferred CoW) ---
+        # Record restore request; batch-execute in flush_deferred_mamba_restores()
+        # before forward pass — enables batch H2D on load_stream.
         if self.flexkv_connector.has_mamba:
             mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
             if mamba_pool_idx is not None and mamba_pool_idx >= 0:
-                try:
-                    token_ids_mamba = marker.key.raw_token_ids()
-                    mamba_hit = marker.mamba_hit_length
-                    if mamba_hit > 0 and mamba_hit < len(token_ids_mamba):
-                        token_ids_mamba = token_ids_mamba[:mamba_hit]
-                    with torch.cuda.stream(self.load_stream):
-                        restored = self.flexkv_connector.retrieve_mamba_state(
-                            token_ids=token_ids_mamba,
-                            mamba_pool_idx=mamba_pool_idx,
-                        )
-                    # GPU-side wait: forward stream waits for H2D copy.
-                    # CPU returns immediately — no synchronize, no blocking.
-                    torch.cuda.current_stream().wait_stream(self.load_stream)
-                    if restored:
-                        if mamba_hit > 0 and mamba_hit < marker.device_length:
-                            req._flexkv_mamba_recompute_seqlen = mamba_hit
-                        logger.debug(
-                            "[FlexKV-Mamba] restored mamba state rid=%s slot=%d mamba_hit=%d device_len=%d recompute=%s",
-                            req.rid, mamba_pool_idx, mamba_hit, marker.device_length,
-                            getattr(req, "_flexkv_mamba_recompute_seqlen", None),
-                        )
-                except Exception as exc:
-                    logger.debug("[FlexKV-Mamba] retrieve in init_load_back: %s", exc)
+                token_ids_mamba = marker.key.raw_token_ids()
+                mamba_hit = marker.mamba_hit_length
+                if mamba_hit > 0 and mamba_hit < len(token_ids_mamba):
+                    token_ids_mamba = token_ids_mamba[:mamba_hit]
+                self._deferred_mamba_restores.append(
+                    (req, token_ids_mamba, mamba_pool_idx, mamba_hit, marker.device_length)
+                )
 
         # decode_interval: start tracking this request for periodic decode checkpoint
         if self.flexkv_connector.has_mamba:
@@ -619,12 +604,39 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             except Exception as exc:
                 logger.debug("[FlexKV] write_back flush failed: %s", exc)
 
+    def _flush_deferred_mamba_restores(self) -> None:
+        """Batch-process deferred mamba CoW restores.
+
+        Collects all deferred restores from init_load_back calls, submits
+        them as a batch on load_stream, then makes forward stream wait once.
+        This batches multiple H2D copies into a single stream submission.
+        """
+        if not self._deferred_mamba_restores:
+            return
+        pending = self._deferred_mamba_restores
+        self._deferred_mamba_restores = []
+        with torch.cuda.stream(self.load_stream):
+            for req, token_ids, mamba_pool_idx, mamba_hit, device_len in pending:
+                try:
+                    restored = self.flexkv_connector.retrieve_mamba_state(
+                        token_ids=token_ids,
+                        mamba_pool_idx=mamba_pool_idx,
+                    )
+                    if restored and mamba_hit > 0 and mamba_hit < device_len:
+                        req._flexkv_mamba_recompute_seqlen = mamba_hit
+                except Exception as exc:
+                    logger.debug("[FlexKV-Mamba] deferred restore failed: %s", exc)
+        # Single wait: forward stream waits for all batch H2D copies
+        torch.cuda.current_stream().wait_stream(self.load_stream)
+
     def evict(self, params: EvictParams) -> EvictResult:
+        self._flush_deferred_mamba_restores()  # batch CoW before eviction
         self._flush_pending_writeback()  # write_back: D2H before GPU free
         self._drain_completed_stores()
         return self._inner_cache.evict(params)
 
     def check_hicache_events(self) -> None:
+        self._flush_deferred_mamba_restores()  # batch CoW before forward
         self._flush_pending_writeback()  # write_back: opportunistic D2H
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
