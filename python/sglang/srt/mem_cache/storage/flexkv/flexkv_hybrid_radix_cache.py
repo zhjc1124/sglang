@@ -467,9 +467,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                             token_ids=branch_token_ids,
                             mamba_pool_idx=mamba_pool_idx,
                         )
-                mamba_conn = self.flexkv_connector._mamba_connector
-                if mamba_conn is not None:
-                    mamba_conn.mark_branch_point(branch_token_ids)
+                # Branch points are automatically identified by the radix tree
+                # (nodes with multiple children) — no explicit marking needed.
             except Exception:
                 pass
 
