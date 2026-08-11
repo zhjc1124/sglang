@@ -121,11 +121,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
 
-        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
         self._deferred_mamba_restores: list = []  # batch CoW: (req, token_ids, idx, mamba_hit, device_len)
 
         # decode_interval: track running requests for periodic checkpoint
-        self._decode_checkpoint_interval = GLOBAL_CONFIG_FROM_ENV.mamba_decode_interval
+        self._decode_checkpoint_interval = getattr(server_args, "mamba_track_interval", 256)
         self._mamba_chunk_size = getattr(server_args, "mamba_cache_chunk_size", 1)
         self._decode_tracking: dict[str, tuple] = {}  # rid → (req, mamba_pool_idx, last_ckpt_len)
     def reset(self) -> None:
