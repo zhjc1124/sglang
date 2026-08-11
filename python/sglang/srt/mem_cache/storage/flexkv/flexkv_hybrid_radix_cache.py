@@ -123,10 +123,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         self._deferred_mamba_restores: list = []  # batch CoW: (req, token_ids, idx, mamba_hit, device_len)
 
-        # decode_interval: track running requests for periodic checkpoint
-        self._decode_checkpoint_interval = getattr(server_args, "mamba_track_interval", 256)
-        self._mamba_chunk_size = getattr(server_args, "mamba_cache_chunk_size", 1)
-        self._decode_tracking: dict[str, tuple] = {}  # rid → (req, mamba_pool_idx, last_ckpt_len)
     def reset(self) -> None:
         # FlexKV still owns references to GPU source/destination slots while an
         # asynchronous store or layerwise load is in flight. Drain those tasks
@@ -135,7 +131,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._free_uncommitted_restores()
         self._inner_cache.reset()
         self._load_markers.clear()
-        self._decode_tracking.clear()
         with self._node_lock:
             self._inflight_store_nodes.clear()
 
@@ -280,13 +275,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 self._deferred_mamba_restores.append(
                     (req, token_ids_mamba, mamba_pool_idx, mamba_hit, marker.device_length)
                 )
-
-        # decode_interval: start tracking this request for periodic decode checkpoint
-        if self.flexkv_connector.has_mamba:
-            mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
-            if mamba_pool_idx is not None and mamba_pool_idx >= 0:
-                initial_len = len(req.origin_input_ids) + len(req.output_ids)
-                self._decode_tracking[req.rid] = (req, mamba_pool_idx, initial_len)
 
         return device_indices, req.last_node
 
@@ -466,7 +454,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
         self._commit_restore(req)
         if not is_insert:
-            self._decode_tracking.pop(req.rid, None)
             return
 
         # radix_branch: store mamba checkpoint at branch point + mark high priority
@@ -485,8 +472,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                     mamba_conn.mark_branch_point(branch_token_ids)
             except Exception:
                 pass
-
-        self._decode_tracking.pop(req.rid, None)
 
     def cache_unfinished_req(self, req: Req, **kwargs) -> None:
         self._apply_restore_swa_boundary(req)
@@ -611,41 +596,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._flush_deferred_mamba_restores()  # batch CoW before forward
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
-        # decode_interval: periodic checkpoint during decode
-        if self.flexkv_connector.has_mamba and self._decode_tracking:
-            self._maybe_decode_checkpoint()
-
-    def _maybe_decode_checkpoint(self) -> None:
-        """Store mamba state checkpoint for requests that have decoded enough tokens."""
-        for rid, (req, mamba_pool_idx, last_ckpt_len) in list(self._decode_tracking.items()):
-            try:
-                current_len = len(req.origin_input_ids) + len(req.output_ids)
-            except Exception:
-                self._decode_tracking.pop(rid, None)
-                continue
-            if current_len - last_ckpt_len < self._decode_checkpoint_interval:
-                continue
-            # Align checkpoint to chunk boundary (like sglang mamba_cache_chunk_size)
-            if self._mamba_chunk_size > 1:
-                aligned_len = (current_len // self._mamba_chunk_size) * self._mamba_chunk_size
-                if aligned_len <= last_ckpt_len:
-                    continue  # not enough new tokens past the aligned boundary
-                current_len = aligned_len
-            token_ids = (list(req.origin_input_ids[:]) + list(req.output_ids[:]))[:current_len]
-            try:
-                with torch.cuda.stream(self.store_stream):
-                    self.flexkv_connector.store_mamba_state(
-                        rid=rid,
-                        token_ids=token_ids,
-                        mamba_pool_idx=mamba_pool_idx,
-                    )
-                self._decode_tracking[rid] = (req, mamba_pool_idx, current_len)
-                logger.debug(
-                    "[FlexKV-Mamba] decode checkpoint: rid=%s tokens=%d (+%d since last)",
-                    rid, current_len, current_len - last_ckpt_len,
-                )
-            except Exception as exc:
-                logger.debug("[FlexKV-Mamba] decode checkpoint failed: %s", exc)
 
     def _drain_completed_stores(self) -> None:
         completed = self.flexkv_connector.check_completed_stores()
@@ -660,7 +610,6 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self._load_markers.pop(rid, None)
-        self._decode_tracking.pop(rid, None)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
         # Do not free an active restore here. Scheduled aborts immediately flow
